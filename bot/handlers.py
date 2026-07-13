@@ -12,6 +12,7 @@
 
 Адаптировано под connection-per-request (database.py) и httpx (gemini.py).
 """
+import asyncio
 import logging
 import re
 from datetime import datetime
@@ -492,17 +493,19 @@ async def _handle_free_reading(update: Update, user_id: int, user: dict) -> None
 
 async def _handle_conversation(update: Update, user_id: int, text: str, user: dict) -> None:
     """Свободный диалог — основное состояние бота."""
-    msg_count = await db.increment_message_count(user_id)
+    # Параллельные DB-запросы для скорости
+    msg_count, facts, history = await asyncio.gather(
+        db.increment_message_count(user_id),
+        db.get_memory_facts(user_id, min_importance=3),
+        db.get_recent_messages(user_id, limit=8),
+    )
 
     # Собираем контекст
     name = user.get("name") or user.get("first_name") or "милый человек"
     birth_date = user.get("birth_date")
     date_str = birth_date.strftime("%d.%m.%Y") if hasattr(birth_date, "strftime") else str(birth_date) if birth_date else ""
 
-    facts = await db.get_memory_facts(user_id, min_importance=3)
-    history = await db.get_recent_messages(user_id, limit=8)
-
-    # Генерируем ответ через Gemini (httpx, 8 сек таймаут)
+    # Генерируем ответ через LLM (OpenRouter/Gemini)
     response = await generate_response(
         user_name=name,
         birth_date=date_str,
