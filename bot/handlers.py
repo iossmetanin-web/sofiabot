@@ -276,6 +276,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     # ─── Rate Limiting ───
     if not await _check_rate_limit(user_id):
+        await update.message.reply_text("Подожди чуток, милый человек... Я не успеваю.")
         return
 
     # ─── Получаем пользователя ───
