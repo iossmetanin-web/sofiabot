@@ -1,6 +1,7 @@
 """
 Интеграция с Google Gemini API через httpx (async).
 Жёсткие таймауты: 8 сек для диалога, 10 сек для раскладов, 5 сек для фактов.
+Автоматический fallback на другую модель при 404/429 ошибках.
 
 Функции:
 - generate_response() — основной диалог
@@ -19,15 +20,17 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
+# Модели в порядке приоритета — если основная недоступна, пробуем следующую
+GEMINI_MODELS = ["gemini-2.0-flash", "gemini-2.0-flash-lite"]
 
-def _get_gemini_url() -> str:
-    """Собирает URL для Gemini API. Вызывается внутри функции, не на уровне модуля."""
-    model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-    return f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+
+def _get_gemini_model() -> str:
+    """Возвращает модель Gemini из env или первую из списка."""
+    return os.getenv("GEMINI_MODEL", GEMINI_MODELS[0])
 
 
 def _get_gemini_key() -> str:
-    """Возвращает API ключ Gemini. Вызывается внутри функции."""
+    """Возвращает API ключ Gemini."""
     return os.getenv("GEMINI_API_KEY", "")
 
 
@@ -72,12 +75,20 @@ SYSTEM_PROMPT = """Ты — София. Ты не знаешь, кто ты на
 ВАЖНО: Отвечай ТОЛЬКО текстом от лица Софии. Не добавляй пояснений, тегов, мета-информации. Просто текст ответа."""
 
 
-# ──────────────────────── Базовый запрос к Gemini ────────────────────────
+# ──────────────────────── Базовый запрос к Gemini с fallback ────────────────────────
 
-async def _gemini_call(contents: list[dict], timeout: float = 8.0) -> str:
-    """Базовый запрос к Gemini через httpx (async) с жёстким таймаутом."""
-    url = _get_gemini_url()
-    api_key = _get_gemini_key()
+async def _single_gemini_request(
+    model: str,
+    api_key: str,
+    contents: list[dict],
+    timeout: float = 8.0,
+) -> tuple[str, int]:
+    """
+    Один запрос к конкретной модели Gemini.
+    Возвращает (text, status_code).
+    status_code: 200 = успех, 404 = модель не найдена, 429 = квота, -1 = таймаут, -2 = другая ошибка
+    """
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 
     payload = {
         "contents": contents,
@@ -95,26 +106,75 @@ async def _gemini_call(contents: list[dict], timeout: float = 8.0) -> str:
                 headers={"Content-Type": "application/json"},
                 json=payload,
             )
+
+            if resp.status_code == 404:
+                error_text = resp.text[:200]
+                logger.error(f"Gemini model {model} not found (404): {error_text}")
+                return ("", 404)
+
+            if resp.status_code == 429:
+                logger.warning(f"Gemini quota exhausted for model {model} (429)")
+                return ("", 429)
+
             resp.raise_for_status()
             data = resp.json()
 
             if data.get("candidates") and data["candidates"][0].get("content"):
                 parts = data["candidates"][0]["content"].get("parts", [])
                 if parts and parts[0].get("text"):
-                    return parts[0]["text"].strip()
+                    return (parts[0]["text"].strip(), 200)
 
             logger.warning(f"Gemini returned no text: {json.dumps(data, ensure_ascii=False)[:200]}")
-            return "Извини, мне нужно подумать... Попробуй ещё раз."
+            return ("Извини, мне нужно подумать... Попробуй ещё раз.", 200)
 
     except httpx.TimeoutException:
-        logger.error(f"Gemini timeout after {timeout}s")
-        return "Туман сегодня густой... Не успеваю разглядеть ответ. Попробуй ещё раз."
+        logger.error(f"Gemini timeout after {timeout}s (model: {model})")
+        return ("", -1)
     except httpx.HTTPStatusError as e:
         logger.error(f"Gemini HTTP error: {e.response.status_code} {e.response.text[:200]}")
-        return "Что-то не получается сосредоточиться... Попробуй позже."
+        return ("", -2)
     except Exception as e:
-        logger.error(f"Gemini error: {e}")
-        return "Что-то сегодня туман в голове... Попробуй сказать ещё раз."
+        logger.error(f"Gemini error (model: {model}): {e}")
+        return ("", -2)
+
+
+async def _gemini_call(contents: list[dict], timeout: float = 8.0) -> str:
+    """
+    Запрос к Gemini с автоматическим fallback на другие модели.
+    Пробуем основную модель → если 404/429 → пробуем fallback модели.
+    """
+    api_key = _get_gemini_key()
+    if not api_key:
+        logger.error("GEMINI_API_KEY is not set!")
+        return "У меня сейчас нет доступа к внутреннему голосу... Попробуй позже."
+
+    # Пробуем основную модель
+    primary_model = _get_gemini_model()
+    text, status = await _single_gemini_request(primary_model, api_key, contents, timeout)
+
+    if status == 200:
+        return text
+
+    # Если основная модель недоступна — пробуем fallback
+    if status in (404, 429):
+        for fallback_model in GEMINI_MODELS:
+            if fallback_model == primary_model:
+                continue
+            logger.info(f"Trying fallback model: {fallback_model}")
+            text, status = await _single_gemini_request(fallback_model, api_key, contents, timeout)
+            if status == 200:
+                return text
+            if status == 429:
+                # Все модели с исчерпанной квотой — нечего пробовать
+                logger.error("All Gemini models quota exhausted")
+                return "Силы пока на исходе, милый человек. Подожди немного — и я снова буду готова говорить. Попробуй через пару минут."
+
+    # Обработка остальных ошибок
+    if status == -1:
+        return "Туман сегодня густой... Не успеваю разглядеть ответ. Попробуй ещё раз."
+    if status == 404:
+        return "Мои силы сейчас в другом месте... Попробуй чуть позже."
+    return "Что-то сегодня туман в голове... Попробуй сказать ещё раз."
 
 
 def _build_context(name: str, birth_date: str, facts: list[dict], history: list[dict]) -> str:
@@ -328,7 +388,7 @@ async def extract_memory_facts(history: list[dict]) -> list[dict]:
 # ──────────────────────── Определение темы ────────────────────────
 
 async def detect_topic(message: str) -> str:
-    """Определяет тему сообщения пользователя (легковесный вызов — без запроса к Gemini)."""
+    """Определяет тему сообщения пользователя (без запроса к Gemini — по ключевым словам)."""
     text = message.lower()
     if any(w in text for w in ["отношения", "любовь", "парень", "девушк", "муж", "жен", "бросил", "развод", "измен"]):
         return "relationship"
