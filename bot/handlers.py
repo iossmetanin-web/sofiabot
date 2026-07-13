@@ -14,7 +14,6 @@
 """
 import logging
 import re
-import time
 from datetime import datetime
 from typing import Optional
 
@@ -52,19 +51,15 @@ from bot.gemini import (
 
 logger = logging.getLogger(__name__)
 
-# ─────────────────── Rate Limiting ───────────────────
-
-_user_last_message: dict[int, float] = {}
+# ─────────────────── Rate Limiting (через БД) ───────────────────
 
 
-def _check_rate_limit(user_id: int) -> bool:
-    """Проверяет rate limit. Возвращает True, если можно отправить сообщение."""
-    now = time.time()
-    last = _user_last_message.get(user_id, 0)
-    if now - last < config.RATE_LIMIT_SECONDS:
-        return False
-    _user_last_message[user_id] = now
-    return True
+async def _check_rate_limit(user_id: int) -> bool:
+    """Проверяет rate limit через БД. Возвращает True, если можно отправить сообщение."""
+    allowed = await db.check_rate_limit(user_id, config.RATE_LIMIT_SECONDS)
+    if allowed:
+        await db.update_rate_limit(user_id)
+    return allowed
 
 
 # ─────────────────── Хелперы ───────────────────
@@ -280,7 +275,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     text_lower = text_stripped.lower()
 
     # ─── Rate Limiting ───
-    if not _check_rate_limit(user_id):
+    if not await _check_rate_limit(user_id):
         return
 
     # ─── Получаем пользователя ───

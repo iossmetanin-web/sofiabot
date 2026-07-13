@@ -38,7 +38,7 @@ class Config:
     TARO_SMALL_COST: int = 1      # Малый расклад — 1 кристалл
     TARO_FULL_COST: int = 3       # Полный расклад — 3 кристалла
     HOROSCOPE_COST: int = 2       # Гороскоп — 2 кристалла
-    CONTEXT_MESSAGES_LIMIT: int = 20  # Последние N сообщений для контекста
+    CONTEXT_MESSAGES_LIMIT: int = 8   # Последние N сообщений для контекста (8 — чтобы уложиться в таймаут Vercel)
     MEMORY_IMPORTANCE_THRESHOLD: int = 3  # Минимальная важность фактов
     MEMORY_EXTRACT_INTERVAL: int = 5  # Извлекать факты каждые N сообщений
     RATE_LIMIT_SECONDS: float = 2.0  # Минимальный интервал между сообщениями

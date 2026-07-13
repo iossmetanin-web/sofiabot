@@ -1,12 +1,14 @@
 """
-Vercel Serverless Function — webhook endpoint для Telegram бота.
+Vercel Serverless Function — webhook endpoint для Telegram бота София.
 
 Принимает POST-запросы от Telegram, обрабатывает update и возвращает 200 OK.
 
-URL: https://your-app.vercel.app/api/webhook
+URL: https://sofiabot-git-main-iossmetanin-webs-projects.vercel.app/api/webhook
 
-Используем asyncio.run() для каждого запроса — безопасно, т.к.
-мы НЕ храним persistent соединения (БД открывается/закрывается внутри запроса).
+Безопасная работа с asyncio на Vercel Serverless:
+- _bot_app и _db_initialized — глобальные, переживают warm starts
+- asyncio.run() — безопасен, т.к. Flask sync и нового loop не существует
+- БД открывает/закрывает соединение на каждый запрос (connection-per-request)
 """
 import os
 import asyncio
@@ -28,38 +30,44 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 
-# Глобальное приложение — создаётся при "cold start" Vercel
-_application = None
+# Глобальные объекты — инициализируются один раз при cold start, переживают warm starts
+_bot_app: Application | None = None
+_db_initialized: bool = False
 
 
-def get_application():
-    """Инициализирует Telegram Application при первом вызове (cold start)."""
-    global _application
-    if _application is None:
+async def _init():
+    """Инициализация Telegram Application и БД. Вызывается один раз."""
+    global _bot_app, _db_initialized
+
+    if _bot_app is None:
         from bot.handlers import setup_handlers
-        from bot.database import init_db
 
-        _application = Application.builder().token(TOKEN).build()
-        setup_handlers(_application)
-        # Создаём таблицы при первом запуске
-        asyncio.run(init_db())
+        _bot_app = Application.builder().token(TOKEN).build()
+        setup_handlers(_bot_app)
         logger.info("Telegram Application initialized (cold start)")
-    return _application
+
+    if not _db_initialized:
+        from bot.database import init_db
+        try:
+            await init_db()
+            _db_initialized = True
+            logger.info("Database tables initialized")
+        except Exception as e:
+            logger.error(f"Database init error: {e}")
+            # Не падаем — таблицы могут уже существовать
 
 
 @app.route("/api/webhook", methods=["POST"])
 def webhook():
     """Webhook endpoint для Telegram."""
     try:
-        application = get_application()
-        update = Update.de_json(request.get_json(force=True), application.bot)
+        # Инициализация при первом запросе
+        asyncio.run(_init())
 
-        # process_update — async, Flask — sync. asyncio.run() создаёт новый loop,
-        # но мы НЕ храним persistent соединения (БД открывается/закрывается внутри),
-        # поэтому это безопасно.
-        asyncio.run(application.process_update(update))
+        # Обработка update
+        update = Update.de_json(request.get_json(force=True), _bot_app.bot)
+        asyncio.run(_bot_app.process_update(update))
 
         return jsonify({"status": "ok"}), 200
 

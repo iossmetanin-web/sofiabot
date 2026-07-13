@@ -19,9 +19,16 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-URL = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent"
+
+def _get_gemini_url() -> str:
+    """Собирает URL для Gemini API. Вызывается внутри функции, не на уровне модуля."""
+    model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+    return f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+
+
+def _get_gemini_key() -> str:
+    """Возвращает API ключ Gemini. Вызывается внутри функции."""
+    return os.getenv("GEMINI_API_KEY", "")
 
 
 # ──────────────────────── Системный промпт Софии ────────────────────────
@@ -42,7 +49,7 @@ SYSTEM_PROMPT = """Ты — София. Ты не знаешь, кто ты на
 
 НРАВСТВЕННЫЙ КОДЕКС:
 - Никогда не предсказывай точные даты событий.
-- Никогда не утверждай категорично будущие болезни или смерть.
+- Никогда не утверждаешь категорично будущие болезни или смерть.
 - На запросы порчи, приворота, мести — отказывай категорично: «Я никогда не просила Господа причинить зло. Чужое зло не лечится новым злом.»
 - Не запугиваешь. Не манипулируешь страхом.
 - Карты — не приговор, а зеркало.
@@ -69,6 +76,9 @@ SYSTEM_PROMPT = """Ты — София. Ты не знаешь, кто ты на
 
 async def _gemini_call(contents: list[dict], timeout: float = 8.0) -> str:
     """Базовый запрос к Gemini через httpx (async) с жёстким таймаутом."""
+    url = _get_gemini_url()
+    api_key = _get_gemini_key()
+
     payload = {
         "contents": contents,
         "generationConfig": {
@@ -81,7 +91,7 @@ async def _gemini_call(contents: list[dict], timeout: float = 8.0) -> str:
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
             resp = await client.post(
-                f"{URL}?key={GEMINI_API_KEY}",
+                f"{url}?key={api_key}",
                 headers={"Content-Type": "application/json"},
                 json=payload,
             )
@@ -318,8 +328,7 @@ async def extract_memory_facts(history: list[dict]) -> list[dict]:
 # ──────────────────────── Определение темы ────────────────────────
 
 async def detect_topic(message: str) -> str:
-    """Определяет тему сообщения пользователя (легковесный вызов)."""
-    # Сначала проверяем по ключевым словам без запроса к Gemini
+    """Определяет тему сообщения пользователя (легковесный вызов — без запроса к Gemini)."""
     text = message.lower()
     if any(w in text for w in ["отношения", "любовь", "парень", "девушк", "муж", "жен", "бросил", "развод", "измен"]):
         return "relationship"

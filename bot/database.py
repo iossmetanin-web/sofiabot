@@ -72,6 +72,12 @@ async def init_db():
                 created_at TIMESTAMP DEFAULT NOW()
             )
         ''')
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS rate_limits (
+                user_id BIGINT PRIMARY KEY,
+                last_message_at TIMESTAMP DEFAULT NOW()
+            )
+        ''')
         # Индексы
         await conn.execute('''
             CREATE INDEX IF NOT EXISTS idx_conversations_user_created
@@ -331,6 +337,41 @@ async def get_memory_facts(user_id: int, min_importance: int = 3) -> list[dict]:
             user_id, min_importance,
         )
         return [dict(r) for r in rows]
+    finally:
+        await conn.close()
+
+
+# ─── Rate Limiting (через БД, не в памяти) ───
+
+async def check_rate_limit(user_id: int, min_interval_seconds: float = 2.0) -> bool:
+    """Проверяет rate limit через БД. Возвращает True, если можно отправить сообщение."""
+    conn = await get_conn()
+    try:
+        row = await conn.fetchrow(
+            "SELECT last_message_at FROM rate_limits WHERE user_id = $1", user_id
+        )
+        if row:
+            from datetime import datetime, timezone
+            last = row["last_message_at"]
+            if last:
+                diff = (datetime.now(timezone.utc) - last).total_seconds()
+                if diff < min_interval_seconds:
+                    return False
+        return True
+    finally:
+        await conn.close()
+
+
+async def update_rate_limit(user_id: int):
+    """Обновляет время последнего сообщения."""
+    conn = await get_conn()
+    try:
+        await conn.execute(
+            """INSERT INTO rate_limits (user_id, last_message_at)
+               VALUES ($1, NOW())
+               ON CONFLICT (user_id) DO UPDATE SET last_message_at = NOW()""",
+            user_id,
+        )
     finally:
         await conn.close()
 
