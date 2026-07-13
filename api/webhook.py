@@ -36,6 +36,8 @@ _db_initialized: bool = False
 async def _process_request(update_data: dict):
     """Обрабатывает один запрос: инициализация + обработка update. Всё в одном event loop."""
     global _bot_app, _db_initialized
+    import time as _time
+    _t0 = _time.monotonic()
 
     # ─── Инициализация (один раз при cold start) ───
     if _bot_app is None:
@@ -63,6 +65,8 @@ async def _process_request(update_data: dict):
         return
 
     await _bot_app.process_update(update)
+    _elapsed = _time.monotonic() - _t0
+    logger.info(f"[TIMING] Total request processing: {_elapsed:.2f}s")
 
 
 @app.route("/api/webhook", methods=["POST"])
