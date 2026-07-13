@@ -1,11 +1,15 @@
 {
   "version": 2,
-  "functions": {
-    "api/webhook.py": {
-      "runtime": "python3.12",
-      "maxDuration": 60
+  "builds": [
+    {
+      "src": "api/webhook.py",
+      "use": "@vercel/python",
+      "config": {
+        "maxLambdaSize": "50mb",
+        "runtime": "python3.12"
+      }
     }
-  },
+  ],
   "routes": [
     {
       "src": "/api/webhook",
