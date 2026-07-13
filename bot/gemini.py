@@ -1,15 +1,13 @@
 """
-Интеграция с Google Gemini API через httpx (async).
-Жёсткие таймауты: 8 сек для диалога, 10 сек для раскладов, 5 сек для фактов.
-Автоматический fallback на другую модель при 404/429 ошибках.
+Интеграция с LLM API — поддержка нескольких провайдеров:
+- Gemini (Google AI) — по умолчанию
+- Groq — бесплатный, быстрый (Llama 3.3 70B)
+- OpenRouter — много бесплатных моделей
 
-Функции:
-- generate_response() — основной диалог
-- generate_fate_card() — Карта судьбы (бесплатно)
-- generate_taro_reading() — Расклад Таро (платно)
-- generate_horoscope() — Гороскоп (платно)
-- extract_memory_facts() — Извлечение фактов из диалога
-- detect_topic() — Определение темы сообщения
+Провайдер выбирается через env var LLM_PROVIDER (gemini/groq/openrouter).
+Все провайдеры используют одинаковые функции → handlers.py не меняется.
+
+Жёсткие таймауты: 8 сек для диалога, 10 сек для раскладов, 5 сек для фактов.
 """
 import os
 import json
@@ -20,18 +18,26 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
-# Модели в порядке приоритета — если основная недоступна, пробуем следующую
+# ─── Конфигурация провайдеров ───
+
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "gemini").lower()
+
+# Gemini
 GEMINI_MODELS = ["gemini-2.0-flash", "gemini-2.0-flash-lite"]
 
+# Groq (бесплатный, быстрый)
+GROQ_BASE_URL = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_MODEL = os.getenv("LLM_MODEL", "llama-3.3-70b-versatile")
 
-def _get_gemini_model() -> str:
-    """Возвращает модель Gemini из env или первую из списка."""
-    return os.getenv("GEMINI_MODEL", GEMINI_MODELS[0])
+# OpenRouter (много бесплатных моделей)
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1/chat/completions"
+OPENROUTER_MODEL = os.getenv("LLM_MODEL", "meta-llama/llama-3.3-70b-instruct:free")
 
 
-def _get_gemini_key() -> str:
-    """Возвращает API ключ Gemini."""
-    return os.getenv("GEMINI_API_KEY", "")
+def _get_api_key() -> str:
+    """Возвращает API ключ для текущего провайдера."""
+    key = os.getenv("LLM_API_KEY", "") or os.getenv("GEMINI_API_KEY", "")
+    return key
 
 
 # ──────────────────────── Системный промпт Софии ────────────────────────
@@ -75,158 +81,231 @@ SYSTEM_PROMPT = """Ты — София. Ты не знаешь, кто ты на
 ВАЖНО: Отвечай ТОЛЬКО текстом от лица Софии. Не добавляй пояснений, тегов, мета-информации. Просто текст ответа."""
 
 
-# ──────────────────────── Базовый запрос к Gemini с fallback ────────────────────────
+# ──────────────────────── Gemini Provider ────────────────────────
 
-async def _single_gemini_request(
-    model: str,
-    api_key: str,
-    contents: list[dict],
-    timeout: float = 8.0,
+async def _gemini_single_request(
+    model: str, api_key: str, contents: list[dict], timeout: float = 8.0
 ) -> tuple[str, int]:
-    """
-    Один запрос к конкретной модели Gemini.
-    Возвращает (text, status_code).
-    status_code: 200 = успех, 404 = модель не найдена, 429 = квота, -1 = таймаут, -2 = другая ошибка
-    """
+    """Один запрос к Gemini API. Возвращает (text, status_code)."""
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-
     payload = {
         "contents": contents,
-        "generationConfig": {
-            "temperature": 0.85,
-            "maxOutputTokens": 1024,
-            "topP": 0.92,
-        },
+        "generationConfig": {"temperature": 0.85, "maxOutputTokens": 1024, "topP": 0.92},
     }
-
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
-            resp = await client.post(
-                f"{url}?key={api_key}",
-                headers={"Content-Type": "application/json"},
-                json=payload,
-            )
-
+            resp = await client.post(f"{url}?key={api_key}", headers={"Content-Type": "application/json"}, json=payload)
             if resp.status_code == 404:
-                error_text = resp.text[:200]
-                logger.error(f"Gemini model {model} not found (404): {error_text}")
+                logger.error(f"Gemini model {model} not found (404)")
                 return ("", 404)
-
             if resp.status_code == 429:
-                logger.warning(f"Gemini quota exhausted for model {model} (429)")
+                logger.warning(f"Gemini quota exhausted for {model} (429)")
                 return ("", 429)
-
             resp.raise_for_status()
             data = resp.json()
-
             if data.get("candidates") and data["candidates"][0].get("content"):
                 parts = data["candidates"][0]["content"].get("parts", [])
                 if parts and parts[0].get("text"):
                     return (parts[0]["text"].strip(), 200)
-
-            logger.warning(f"Gemini returned no text: {json.dumps(data, ensure_ascii=False)[:200]}")
+            logger.warning(f"Gemini no text: {json.dumps(data, ensure_ascii=False)[:200]}")
             return ("Извини, мне нужно подумать... Попробуй ещё раз.", 200)
-
     except httpx.TimeoutException:
-        logger.error(f"Gemini timeout after {timeout}s (model: {model})")
         return ("", -1)
-    except httpx.HTTPStatusError as e:
-        logger.error(f"Gemini HTTP error: {e.response.status_code} {e.response.text[:200]}")
-        return ("", -2)
     except Exception as e:
-        logger.error(f"Gemini error (model: {model}): {e}")
+        logger.error(f"Gemini error ({model}): {e}")
         return ("", -2)
 
 
 async def _gemini_call(contents: list[dict], timeout: float = 8.0) -> str:
-    """
-    Запрос к Gemini с автоматическим fallback на другие модели.
-    Пробуем основную модель → если 404/429 → пробуем fallback модели.
-    """
-    api_key = _get_gemini_key()
+    """Gemini с fallback на другие модели."""
+    api_key = _get_api_key()
     if not api_key:
-        logger.error("GEMINI_API_KEY is not set!")
-        return "У меня сейчас нет доступа к внутреннему голосу... Попробуй позже."
+        return "У меня нет доступа к внутреннему голосу... Попробуй позже."
 
-    # Пробуем основную модель
-    primary_model = _get_gemini_model()
-    text, status = await _single_gemini_request(primary_model, api_key, contents, timeout)
-
+    model = os.getenv("GEMINI_MODEL", GEMINI_MODELS[0])
+    text, status = await _gemini_single_request(model, api_key, contents, timeout)
     if status == 200:
         return text
 
-    # Если основная модель недоступна — пробуем fallback
     if status in (404, 429):
-        for fallback_model in GEMINI_MODELS:
-            if fallback_model == primary_model:
+        for fallback in GEMINI_MODELS:
+            if fallback == model:
                 continue
-            logger.info(f"Trying fallback model: {fallback_model}")
-            text, status = await _single_gemini_request(fallback_model, api_key, contents, timeout)
+            logger.info(f"Gemini fallback: {fallback}")
+            text, status = await _gemini_single_request(fallback, api_key, contents, timeout)
             if status == 200:
                 return text
             if status == 429:
-                # Все модели с исчерпанной квотой — нечего пробовать
-                logger.error("All Gemini models quota exhausted")
-                return "Силы пока на исходе, милый человек. Подожди немного — и я снова буду готова говорить. Попробуй через пару минут."
+                break
+        logger.error("All Gemini models exhausted")
+        return "Силы пока на исходе, милый человек. Подожди немного — и я снова буду готова говорить."
 
-    # Обработка остальных ошибок
     if status == -1:
         return "Туман сегодня густой... Не успеваю разглядеть ответ. Попробуй ещё раз."
-    if status == 404:
-        return "Мои силы сейчас в другом месте... Попробуй чуть позже."
     return "Что-то сегодня туман в голове... Попробуй сказать ещё раз."
 
 
+# ──────────────────────── OpenAI-Compatible Provider (Groq / OpenRouter) ────
+
+async def _openai_compatible_call(
+    base_url: str, api_key: str, model: str, messages: list[dict], timeout: float = 8.0
+) -> tuple[str, int]:
+    """Запрос к OpenAI-совместимому API. Возвращает (text, status_code)."""
+    payload = {
+        "model": model,
+        "messages": messages,
+        "temperature": 0.85,
+        "max_tokens": 1024,
+        "top_p": 0.92,
+    }
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.post(base_url, headers=headers, json=payload)
+            if resp.status_code == 429:
+                logger.warning(f"Rate limited on {base_url} ({model})")
+                return ("", 429)
+            if resp.status_code == 401:
+                logger.error(f"Auth failed for {base_url}")
+                return ("", 401)
+            resp.raise_for_status()
+            data = resp.json()
+            if data.get("choices") and data["choices"][0].get("message"):
+                content = data["choices"][0]["message"].get("content", "")
+                if content:
+                    return (content.strip(), 200)
+            logger.warning(f"No text from {base_url}: {json.dumps(data)[:200]}")
+            return ("Извини, мне нужно подумать... Попробуй ещё раз.", 200)
+    except httpx.TimeoutException:
+        return ("", -1)
+    except Exception as e:
+        logger.error(f"OpenAI-compatible error ({model}): {e}")
+        return ("", -2)
+
+
+def _contents_to_messages(contents: list[dict]) -> list[dict]:
+    """Конвертирует Gemini contents format в OpenAI messages format."""
+    messages = []
+    for c in contents:
+        role = c.get("role", "user")
+        # Gemini uses "model" for assistant, OpenAI uses "assistant"
+        if role == "model":
+            role = "assistant"
+        parts = c.get("parts", [])
+        text = " ".join(p.get("text", "") for p in parts if p.get("text"))
+        if text:
+            messages.append({"role": role, "content": text})
+    return messages
+
+
+async def _groq_call(contents: list[dict], timeout: float = 8.0) -> str:
+    """Запрос через Groq API (Llama 3.3 70B — бесплатный)."""
+    api_key = _get_api_key()
+    if not api_key:
+        return "У меня нет доступа к внутреннему голосу... Попробуй позже."
+
+    messages = _contents_to_messages(contents)
+    model = os.getenv("LLM_MODEL", "llama-3.3-70b-versatile")
+
+    text, status = await _openai_compatible_call(GROQ_BASE_URL, api_key, model, messages, timeout)
+    if status == 200:
+        return text
+    if status == 429:
+        return "Силы пока на исходе, милый человек. Подожди немного — и я снова буду готова говорить."
+    if status == 401:
+        return "У меня проблемы с доступом к памяти... Администратору нужно обновить настройки."
+    if status == -1:
+        return "Туман сегодня густой... Не успеваю разглядеть ответ. Попробуй ещё раз."
+    return "Что-то сегодня туман в голове... Попробуй сказать ещё раз."
+
+
+async def _openrouter_call(contents: list[dict], timeout: float = 8.0) -> str:
+    """Запрос через OpenRouter API (много бесплатных моделей)."""
+    api_key = _get_api_key()
+    if not api_key:
+        return "У меня нет доступа к внутреннему голосу... Попробуй позже."
+
+    messages = _contents_to_messages(contents)
+    model = os.getenv("LLM_MODEL", "meta-llama/llama-3.3-70b-instruct:free")
+
+    text, status = await _openai_compatible_call(OPENROUTER_BASE_URL, api_key, model, messages, timeout)
+    if status == 200:
+        return text
+    if status == 429:
+        # Попробуем запасную модель
+        fallbacks = [
+            "qwen/qwen3-next-80b-a3b-instruct:free",
+            "google/gemma-4-31b-it:free",
+            "meta-llama/llama-3.2-3b-instruct:free",
+        ]
+        for fb in fallbacks:
+            if fb == model:
+                continue
+            logger.info(f"OpenRouter fallback: {fb}")
+            text, status = await _openai_compatible_call(OPENROUTER_BASE_URL, api_key, fb, messages, timeout)
+            if status == 200:
+                return text
+        return "Силы пока на исходе, милый человек. Подожди немного."
+    if status == 401:
+        return "У меня проблемы с доступом к памяти... Администратору нужно обновить настройки."
+    if status == -1:
+        return "Туман сегодня густой... Не успеваю разглядеть ответ. Попробуй ещё раз."
+    return "Что-то сегодня туман в голове... Попробуй сказать ещё раз."
+
+
+# ──────────────────────── Единый вызов LLM ────────────────────────
+
+async def _llm_call(contents: list[dict], timeout: float = 8.0) -> str:
+    """Единый вызов LLM через выбранного провайдера."""
+    provider = os.getenv("LLM_PROVIDER", "gemini").lower()
+
+    if provider == "groq":
+        return await _groq_call(contents, timeout)
+    elif provider == "openrouter":
+        return await _openrouter_call(contents, timeout)
+    else:  # gemini (default)
+        return await _gemini_call(contents, timeout)
+
+
+# ──────────────────────── Контекст ────────────────────────
+
 def _build_context(name: str, birth_date: str, facts: list[dict], history: list[dict]) -> str:
-    """Собираем контекст для Gemini."""
+    """Собираем контекст для LLM."""
     lines = [f"Имя пользователя: {name}"]
     if birth_date:
         lines.append(f"Дата рождения: {birth_date}")
-
     if facts:
         lines.append("Важные факты:")
         for f in facts:
             lines.append(f"- {f['fact_type']}: {f['fact_content']}")
-
     if history:
         lines.append("Последние сообщения:")
-        for h in history[-6:]:  # Берём только последние 6 для контекста
+        for h in history[-6:]:
             who = "София" if h["role"] == "sofia" else name
             lines.append(f"{who}: {h['content'][:150]}")
-
     return "\n".join(lines)
 
 
 # ──────────────────────── Основной диалог ────────────────────────
 
-async def generate_response(
-    user_name: str,
-    birth_date: str,
-    facts: list[dict],
-    history: list[dict],
-    user_message: str,
-) -> str:
+async def generate_response(user_name: str, birth_date: str, facts: list[dict], history: list[dict], user_message: str) -> str:
     """Основной ответ Софии."""
     context = _build_context(user_name, birth_date, facts, history)
-
     contents = [
         {"role": "user", "parts": [{"text": SYSTEM_PROMPT}]},
         {"role": "model", "parts": [{"text": "Поняла. Я готова говорить как София."}]},
         {"role": "user", "parts": [{"text": f"{context}\n\nСообщение пользователя: {user_message}"}]},
     ]
-
-    return await _gemini_call(contents, timeout=8.0)
+    return await _llm_call(contents, timeout=8.0)
 
 
 # ──────────────────────── Карта судьбы ────────────────────────
 
-async def generate_fate_card(
-    name: str,
-    birth_date: str,
-    birth_time: Optional[str] = None,
-    birth_place: Optional[str] = None,
-) -> str:
-    """Карта судьбы — бесплатная, но может занять больше времени."""
+async def generate_fate_card(name: str, birth_date: str, birth_time: Optional[str] = None, birth_place: Optional[str] = None) -> str:
+    """Карта судьбы — бесплатная."""
     prompt = f"""Создай психологический портрет (Карту судьбы) для {name}.
 Дата рождения: {birth_date}
 Время: {birth_time or 'неизвестно'}
@@ -254,27 +333,15 @@ async def generate_fate_card(
         {"role": "model", "parts": [{"text": "Поняла."}]},
         {"role": "user", "parts": [{"text": prompt}]},
     ]
-
-    return await _gemini_call(contents, timeout=10.0)
+    return await _llm_call(contents, timeout=10.0)
 
 
 # ──────────────────────── Расклады Таро ────────────────────────
 
-async def generate_taro_reading(
-    name: str,
-    question: str,
-    numbers: list[int],
-    full: bool = False,
-) -> str:
+async def generate_taro_reading(name: str, question: str, numbers: list[int], full: bool = False) -> str:
     """Расклад Таро — малый (5 карт) или полный (20 карт)."""
     count = 20 if full else 5
-    positions_small = [
-        "1. Что сейчас происходит",
-        "2. Что скрыто",
-        "3. Что мешает",
-        "4. Что поможет",
-        "5. К чему идёт",
-    ]
+    positions_small = ["1. Что сейчас происходит", "2. Что скрыто", "3. Что мешает", "4. Что поможет", "5. К чему идёт"]
     positions_full = [
         "1. Прошлое — корни", "2. Детство — первые уроки", "3. Семья — наследие",
         "4. Энергия — что питает", "5. Способности — дары", "6. Страхи — тени",
@@ -301,18 +368,12 @@ async def generate_taro_reading(
 В конце дай краткий совет и задай вопрос для продолжения разговора."""
 
     contents = [{"role": "user", "parts": [{"text": prompt}]}]
-    return await _gemini_call(contents, timeout=10.0)
+    return await _llm_call(contents, timeout=10.0)
 
 
 # ──────────────────────── Гороскоп ────────────────────────
 
-async def generate_horoscope(
-    name: str,
-    birth_date: str,
-    birth_time: Optional[str] = None,
-    birth_place: Optional[str] = None,
-    concerns: str = "",
-) -> str:
+async def generate_horoscope(name: str, birth_date: str, birth_time: Optional[str] = None, birth_place: Optional[str] = None, concerns: str = "") -> str:
     """Персональный гороскоп."""
     prompt = f"""Составь персональный гороскоп для {name}.
 Дата рождения: {birth_date}
@@ -331,10 +392,8 @@ async def generate_horoscope(
 Говори образно, как мудрая бабушка. Не используй астрологические термины напрямую.
 В конце добавь: «Звёзды показывают путь, но шаги делаешь ты, милый/милая.»"""
 
-    contents = [
-        {"role": "user", "parts": [{"text": prompt}]},
-    ]
-    return await _gemini_call(contents, timeout=10.0)
+    contents = [{"role": "user", "parts": [{"text": prompt}]}]
+    return await _llm_call(contents, timeout=10.0)
 
 
 # ──────────────────────── Извлечение фактов ────────────────────────
@@ -345,10 +404,7 @@ async def extract_memory_facts(history: list[dict]) -> list[dict]:
         return []
 
     recent = history[-6:]
-    dialog = "\n".join([
-        f"{'София' if h['role'] == 'sofia' else 'Человек'}: {h['content'][:200]}"
-        for h in recent
-    ])
+    dialog = "\n".join([f"{'София' if h['role'] == 'sofia' else 'Человек'}: {h['content'][:200]}" for h in recent])
 
     prompt = f"""Проанализируй диалог и извлеки 1-3 важных факта о пользователе.
 Возможные типы: pain, relationship, work, family, goal, fear, promise, personality, health.
@@ -360,26 +416,16 @@ async def extract_memory_facts(history: list[dict]) -> list[dict]:
 
     try:
         contents = [{"role": "user", "parts": [{"text": prompt}]}]
-        result = await _gemini_call(contents, timeout=5.0)
+        result = await _llm_call(contents, timeout=5.0)
 
-        # Пытаемся найти JSON в ответе
         start = result.find("[")
         end = result.rfind("]")
         if start != -1 and end != -1:
             facts = json.loads(result[start : end + 1])
             if isinstance(facts, list):
-                valid_types = {
-                    "pain", "relationship", "work", "family",
-                    "goal", "fear", "promise", "personality", "health",
-                }
-                return [
-                    f for f in facts[:3]
-                    if isinstance(f, dict)
-                    and f.get("fact_type") in valid_types
-                    and f.get("fact_content")
-                ]
+                valid_types = {"pain", "relationship", "work", "family", "goal", "fear", "promise", "personality", "health"}
+                return [f for f in facts[:3] if isinstance(f, dict) and f.get("fact_type") in valid_types and f.get("fact_content")]
         return []
-
     except Exception as e:
         logger.error(f"extract_memory_facts error: {e}")
         return []
@@ -388,7 +434,7 @@ async def extract_memory_facts(history: list[dict]) -> list[dict]:
 # ──────────────────────── Определение темы ────────────────────────
 
 async def detect_topic(message: str) -> str:
-    """Определяет тему сообщения пользователя (без запроса к Gemini — по ключевым словам)."""
+    """Определяет тему сообщения (без запроса к LLM — по ключевым словам)."""
     text = message.lower()
     if any(w in text for w in ["отношения", "любовь", "парень", "девушк", "муж", "жен", "бросил", "развод", "измен"]):
         return "relationship"
@@ -400,6 +446,4 @@ async def detect_topic(message: str) -> str:
         return "purpose"
     if any(w in text for w in ["страх", "боюсь", "тревог", "паник", "жуть"]):
         return "fear"
-
-    # Если не определили — общий
     return "general"

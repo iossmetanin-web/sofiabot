@@ -19,7 +19,12 @@ class Config:
     # Telegram
     TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
 
-    # Gemini
+    # LLM Provider: "gemini" (default), "groq", "openrouter"
+    LLM_PROVIDER: str = os.getenv("LLM_PROVIDER", "gemini")
+    LLM_API_KEY: str = os.getenv("LLM_API_KEY", "") or os.getenv("GEMINI_API_KEY", "")
+    LLM_MODEL: str = os.getenv("LLM_MODEL", "")
+
+    # Gemini (legacy, still works)
     GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
     GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
 
@@ -35,14 +40,14 @@ class Config:
 
     # Bot settings
     FREE_CRYSTALS_ON_START: int = 3
-    TARO_SMALL_COST: int = 1      # Малый расклад — 1 кристалл
-    TARO_FULL_COST: int = 3       # Полный расклад — 3 кристалла
-    HOROSCOPE_COST: int = 2       # Гороскоп — 2 кристалла
-    CONTEXT_MESSAGES_LIMIT: int = 8   # Последние N сообщений для контекста (8 — чтобы уложиться в таймаут Vercel)
-    MEMORY_IMPORTANCE_THRESHOLD: int = 3  # Минимальная важность фактов
-    MEMORY_EXTRACT_INTERVAL: int = 5  # Извлекать факты каждые N сообщений
-    RATE_LIMIT_SECONDS: float = 2.0  # Минимальный интервал между сообщениями
-    MAX_RUDENESS_BEFORE_BLOCK: int = 5  # Блокировка после N грубостей
+    TARO_SMALL_COST: int = 1
+    TARO_FULL_COST: int = 3
+    HOROSCOPE_COST: int = 2
+    CONTEXT_MESSAGES_LIMIT: int = 8
+    MEMORY_IMPORTANCE_THRESHOLD: int = 3
+    MEMORY_EXTRACT_INTERVAL: int = 5
+    RATE_LIMIT_SECONDS: float = 2.0
+    MAX_RUDENESS_BEFORE_BLOCK: int = 5
 
     @classmethod
     def validate(cls) -> list[str]:
@@ -50,8 +55,8 @@ class Config:
         missing = []
         if not cls.TELEGRAM_BOT_TOKEN:
             missing.append("TELEGRAM_BOT_TOKEN")
-        if not cls.GEMINI_API_KEY:
-            missing.append("GEMINI_API_KEY")
+        if not cls.LLM_API_KEY and not cls.GEMINI_API_KEY:
+            missing.append("LLM_API_KEY (или GEMINI_API_KEY)")
         if not cls.DATABASE_URL:
             missing.append("DATABASE_URL")
         return missing
