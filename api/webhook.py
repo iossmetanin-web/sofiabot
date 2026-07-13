@@ -89,18 +89,20 @@ def webhook_info():
 @app.route("/api/health", methods=["GET"])
 def health():
     """Health check endpoint с диагностикой."""
-    gemini_key_set = bool(os.getenv("GEMINI_API_KEY"))
+    llm_provider = os.getenv("LLM_PROVIDER", "gemini")
+    llm_key_set = bool(os.getenv("LLM_API_KEY") or os.getenv("GEMINI_API_KEY"))
     db_url_set = bool(os.getenv("DATABASE_URL"))
     token_set = bool(os.getenv("TELEGRAM_BOT_TOKEN"))
-    gemini_model = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+    llm_model = os.getenv("LLM_MODEL", "gemini-2.0-flash" if llm_provider == "gemini" else "unknown")
     return jsonify({
         "status": "ok",
         "service": "Sofia",
         "env_check": {
             "TELEGRAM_BOT_TOKEN": token_set,
-            "GEMINI_API_KEY": gemini_key_set,
+            "LLM_PROVIDER": llm_provider,
+            "LLM_API_KEY": llm_key_set,
+            "LLM_MODEL": llm_model,
             "DATABASE_URL": db_url_set,
-            "GEMINI_MODEL": gemini_model,
         },
         "bot_initialized": _bot_app is not None,
         "db_initialized": _db_initialized,
