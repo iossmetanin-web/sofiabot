@@ -31,7 +31,16 @@ GROQ_MODEL = os.getenv("LLM_MODEL", "llama-3.3-70b-versatile")
 
 # OpenRouter (много бесплатных моделей)
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1/chat/completions"
-OPENROUTER_MODEL = os.getenv("LLM_MODEL", "meta-llama/llama-3.3-70b-instruct:free")
+OPENROUTER_MODEL = os.getenv("LLM_MODEL", "google/gemma-4-26b-a4b-it:free")
+
+# OpenRouter fallback модели (проверенные рабочие, обновлено 2025-07)
+OPENROUTER_FALLBACKS = [
+    "nvidia/nemotron-3-super-120b-a12b:free",
+    "nvidia/nemotron-3-nano-30b-a3b:free",
+    "openai/gpt-oss-20b:free",
+    "nvidia/nemotron-nano-9b-v2:free",
+    "poolside/laguna-m.1:free",
+]
 
 
 def _get_api_key() -> str:
@@ -171,6 +180,15 @@ async def _openai_compatible_call(
             if resp.status_code == 401:
                 logger.error(f"Auth failed for {base_url}")
                 return ("", 401)
+            if resp.status_code == 404:
+                logger.error(f"Model not found on {base_url} ({model})")
+                return ("", 404)
+            if resp.status_code == 400:
+                logger.error(f"Bad request on {base_url} ({model}): {resp.text[:200]}")
+                return ("", 400)
+            if resp.status_code == 503:
+                logger.warning(f"Service unavailable on {base_url} ({model})")
+                return ("", 503)
             resp.raise_for_status()
             data = resp.json()
             if data.get("choices") and data["choices"][0].get("message"):
@@ -223,32 +241,33 @@ async def _groq_call(contents: list[dict], timeout: float = 8.0) -> str:
 
 
 async def _openrouter_call(contents: list[dict], timeout: float = 8.0) -> str:
-    """Запрос через OpenRouter API (много бесплатных моделей)."""
+    """Запрос через OpenRouter API с автоматическим fallback на другие модели."""
     api_key = _get_api_key()
     if not api_key:
         return "У меня нет доступа к внутреннему голосу... Попробуй позже."
 
     messages = _contents_to_messages(contents)
-    model = os.getenv("LLM_MODEL", "meta-llama/llama-3.3-70b-instruct:free")
+    model = os.getenv("LLM_MODEL", OPENROUTER_MODEL)
 
+    # Основной запрос
     text, status = await _openai_compatible_call(OPENROUTER_BASE_URL, api_key, model, messages, timeout)
     if status == 200:
         return text
-    if status == 429:
-        # Попробуем запасную модель
-        fallbacks = [
-            "qwen/qwen3-next-80b-a3b-instruct:free",
-            "google/gemma-4-31b-it:free",
-            "meta-llama/llama-3.2-3b-instruct:free",
-        ]
-        for fb in fallbacks:
+
+    # Fallback на другие модели при ошибках (429, 404, 400, 503)
+    if status in (429, 404, 400, 503, -2):
+        logger.warning(f"OpenRouter primary model {model} failed (status={status}), trying fallbacks...")
+        for fb in OPENROUTER_FALLBACKS:
             if fb == model:
                 continue
             logger.info(f"OpenRouter fallback: {fb}")
-            text, status = await _openai_compatible_call(OPENROUTER_BASE_URL, api_key, fb, messages, timeout)
-            if status == 200:
+            text, fb_status = await _openai_compatible_call(OPENROUTER_BASE_URL, api_key, fb, messages, timeout)
+            if fb_status == 200:
                 return text
-        return "Силы пока на исходе, милый человек. Подожди немного."
+            logger.warning(f"OpenRouter fallback {fb} also failed (status={fb_status})")
+        logger.error("All OpenRouter models exhausted")
+        return "Силы пока на исходе, милый человек. Подожди немного — и я снова буду готова говорить."
+
     if status == 401:
         return "У меня проблемы с доступом к памяти... Администратору нужно обновить настройки."
     if status == -1:
