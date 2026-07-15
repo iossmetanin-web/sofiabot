@@ -38,7 +38,7 @@ class Config:
     WEBHOOK_URL: str = os.getenv("WEBHOOK_URL", "")
     WEBHOOK_SECRET: str = os.getenv("WEBHOOK_SECRET", "sofia_secret_2024")
 
-    # Bot settings
+    # ─── Bot settings ───
     FREE_CRYSTALS_ON_START: int = 3
     TARO_SMALL_COST: int = 1
     TARO_FULL_COST: int = 3
@@ -48,6 +48,14 @@ class Config:
     MEMORY_EXTRACT_INTERVAL: int = 5
     RATE_LIMIT_SECONDS: float = 2.0
     MAX_RUDENESS_BEFORE_BLOCK: int = 5
+
+    # ─── Концепция v2: поток и вовлечение ───
+    PROBING_ROUNDS: int = 1              # сколько вопросов прощупывания до Карты судьбы
+    RETURN_ABSENCE_HOURS: int = 20       # через сколько часов absence — София «вспоминала о тебе»
+    FREE_CARD_COOLDOWN_HOURS: int = 24   # как часто доступна бесплатная 1-карта Таро
+    PAID_HOOK_MIN_MESSAGES: int = 6      # с какого номера сообщения возможен платный хук
+    PAID_HOOK_EVERY: int = 7             # как часто повторять платный хук (каждые N сообщений после минимума)
+    MAX_TARO_NUMBER: int = 78
 
     @classmethod
     def validate(cls) -> list[str]:

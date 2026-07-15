@@ -2,11 +2,16 @@
 Работа с PostgreSQL через asyncpg.
 Connection-per-request: каждое обращение открывает соединение и сразу закрывает.
 НЕТ пула — на Vercel Serverless пул убивает PostgreSQL зомби-коннектами.
+
+Концепция v2: добавлены
+- колонки users: last_seen_at, gender, age_group, probing_count, last_free_card_at, last_topic_summary
+- таблица emotional_memory (главная боль, близкие, обещания, незакрытые вопросы, события)
 """
 import os
 import asyncpg
 import logging
 from typing import Optional
+from datetime import datetime, timezone, timedelta
 
 logger = logging.getLogger(__name__)
 
@@ -19,9 +24,10 @@ async def get_conn():
 
 
 async def init_db():
-    """Создание таблиц при первом запуске."""
+    """Создание таблиц и миграции при первом запуске. Безопасно (IF NOT EXISTS)."""
     conn = await get_conn()
     try:
+        # ─── users ───
         await conn.execute('''
             CREATE TABLE IF NOT EXISTS users (
                 user_id BIGINT PRIMARY KEY,
@@ -41,6 +47,17 @@ async def init_db():
                 updated_at TIMESTAMP DEFAULT NOW()
             )
         ''')
+
+        # Концепция v2 — новые колонки users (безопасная миграция)
+        await conn.execute('ALTER TABLE users ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMP')
+        await conn.execute('ALTER TABLE users ADD COLUMN IF NOT EXISTS gender TEXT DEFAULT NULL')
+        await conn.execute('ALTER TABLE users ADD COLUMN IF NOT EXISTS age_group TEXT DEFAULT NULL')
+        await conn.execute('ALTER TABLE users ADD COLUMN IF NOT EXISTS probing_count INTEGER DEFAULT 0')
+        await conn.execute('ALTER TABLE users ADD COLUMN IF NOT EXISTS last_free_card_at TIMESTAMP')
+        await conn.execute('ALTER TABLE users ADD COLUMN IF NOT EXISTS last_topic_summary TEXT')
+        await conn.execute('ALTER TABLE users ADD COLUMN IF NOT EXISTS onboarding_completed BOOLEAN DEFAULT FALSE')
+
+        # ─── conversations ───
         await conn.execute('''
             CREATE TABLE IF NOT EXISTS conversations (
                 id SERIAL PRIMARY KEY,
@@ -51,6 +68,8 @@ async def init_db():
                 created_at TIMESTAMP DEFAULT NOW()
             )
         ''')
+
+        # ─── memory_facts (существующая) ───
         await conn.execute('''
             CREATE TABLE IF NOT EXISTS memory_facts (
                 id SERIAL PRIMARY KEY,
@@ -62,6 +81,23 @@ async def init_db():
                 updated_at TIMESTAMP DEFAULT NOW()
             )
         ''')
+
+        # ─── emotional_memory (НОВАЯ — концепция v2) ───
+        # Типы: main_pain, loved_one, promise, unfinished_question, life_event, fear, goal, breakthrough
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS emotional_memory (
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT REFERENCES users(user_id) ON DELETE CASCADE,
+                memory_type TEXT NOT NULL,
+                content TEXT NOT NULL,
+                context TEXT,
+                importance INTEGER DEFAULT 3,
+                created_at TIMESTAMP DEFAULT NOW(),
+                updated_at TIMESTAMP DEFAULT NOW()
+            )
+        ''')
+
+        # ─── transactions ───
         await conn.execute('''
             CREATE TABLE IF NOT EXISTS transactions (
                 id SERIAL PRIMARY KEY,
@@ -72,12 +108,15 @@ async def init_db():
                 created_at TIMESTAMP DEFAULT NOW()
             )
         ''')
+
+        # ─── rate_limits ───
         await conn.execute('''
             CREATE TABLE IF NOT EXISTS rate_limits (
                 user_id BIGINT PRIMARY KEY,
                 last_message_at TIMESTAMP DEFAULT NOW()
             )
         ''')
+
         # Индексы
         await conn.execute('''
             CREATE INDEX IF NOT EXISTS idx_conversations_user_created
@@ -87,7 +126,11 @@ async def init_db():
             CREATE INDEX IF NOT EXISTS idx_memory_facts_user_importance
             ON memory_facts(user_id, importance DESC)
         ''')
-        logger.info("Database tables initialized")
+        await conn.execute('''
+            CREATE INDEX IF NOT EXISTS idx_emotional_memory_user_importance
+            ON emotional_memory(user_id, importance DESC)
+        ''')
+        logger.info("Database tables initialized (concept v2 migration applied)")
     finally:
         await conn.close()
 
@@ -109,8 +152,8 @@ async def create_user(user_id: int, username: str, first_name: str) -> dict:
     conn = await get_conn()
     try:
         await conn.execute(
-            """INSERT INTO users (user_id, username, first_name, crystals, state)
-               VALUES ($1, $2, $3, 3, 'START')
+            """INSERT INTO users (user_id, username, first_name, crystals, state, last_seen_at)
+               VALUES ($1, $2, $3, 3, 'START', NOW())
                ON CONFLICT (user_id) DO NOTHING""",
             user_id, username, first_name,
         )
@@ -134,7 +177,7 @@ async def update_user_state(user_id: int, state: str):
     conn = await get_conn()
     try:
         await conn.execute(
-            "UPDATE users SET state = $1, updated_at = NOW() WHERE user_id = $2",
+            "UPDATE users SET state = $1, updated_at = NOW(), last_seen_at = NOW() WHERE user_id = $2",
             state, user_id,
         )
     finally:
@@ -155,6 +198,18 @@ async def update_user_profile(user_id: int, **fields):
         vals.append(user_id)
         query = f"UPDATE users SET {', '.join(sets)}, updated_at = NOW() WHERE user_id = ${len(vals)}"
         await conn.execute(query, *vals)
+    finally:
+        await conn.close()
+
+
+async def touch_last_seen(user_id: int):
+    """Обновляет время последней активности (без изменения state)."""
+    conn = await get_conn()
+    try:
+        await conn.execute(
+            "UPDATE users SET last_seen_at = NOW(), updated_at = NOW() WHERE user_id = $1",
+            user_id,
+        )
     finally:
         await conn.close()
 
@@ -195,7 +250,7 @@ async def increment_message_count(user_id: int) -> int:
     try:
         new_count = await conn.fetchval(
             """UPDATE users
-               SET message_count = message_count + 1, updated_at = NOW()
+               SET message_count = message_count + 1, updated_at = NOW(), last_seen_at = NOW()
                WHERE user_id = $1
                RETURNING message_count""",
             user_id,
@@ -205,8 +260,32 @@ async def increment_message_count(user_id: int) -> int:
         await conn.close()
 
 
+async def increment_probing(user_id: int) -> int:
+    """Увеличивает счётчик вопросов прощупывания."""
+    conn = await get_conn()
+    try:
+        new_count = await conn.fetchval(
+            """UPDATE users SET probing_count = probing_count + 1, updated_at = NOW()
+               WHERE user_id = $1 RETURNING probing_count""",
+            user_id,
+        )
+        return new_count or 0
+    finally:
+        await conn.close()
+
+
+async def mark_onboarding_completed(user_id: int):
+    conn = await get_conn()
+    try:
+        await conn.execute(
+            "UPDATE users SET onboarding_completed = TRUE, updated_at = NOW() WHERE user_id = $1",
+            user_id,
+        )
+    finally:
+        await conn.close()
+
+
 async def get_user_crystals(user_id: int) -> int:
-    """Возвращает текущий баланс кристаллов."""
     conn = await get_conn()
     try:
         crystals = await conn.fetchval(
@@ -218,7 +297,6 @@ async def get_user_crystals(user_id: int) -> int:
 
 
 async def spend_crystals(user_id: int, amount: int, description: str = "") -> bool:
-    """Списывает кристаллы, если хватает. Возвращает True при успехе."""
     conn = await get_conn()
     try:
         async with conn.transaction():
@@ -242,7 +320,6 @@ async def spend_crystals(user_id: int, amount: int, description: str = "") -> bo
 
 
 async def add_crystals(user_id: int, amount: int, description: str = "", txn_type: str = "add"):
-    """Начисляет кристаллы пользователю."""
     conn = await get_conn()
     try:
         async with conn.transaction():
@@ -262,7 +339,6 @@ async def add_crystals(user_id: int, amount: int, description: str = "", txn_typ
 # ─── Conversations ───
 
 async def save_message(user_id: int, role: str, content: str, emotion_tag: str = None):
-    """Сохраняет сообщение в историю диалога."""
     conn = await get_conn()
     try:
         await conn.execute(
@@ -274,7 +350,6 @@ async def save_message(user_id: int, role: str, content: str, emotion_tag: str =
 
 
 async def get_recent_messages(user_id: int, limit: int = 8) -> list[dict]:
-    """Последние N сообщений (8 по умолчанию — чтобы уложиться в таймаут Vercel)."""
     conn = await get_conn()
     try:
         rows = await conn.fetch(
@@ -287,7 +362,6 @@ async def get_recent_messages(user_id: int, limit: int = 8) -> list[dict]:
 
 
 async def get_message_count(user_id: int) -> int:
-    """Общее количество сообщений в диалоге."""
     conn = await get_conn()
     try:
         count = await conn.fetchval(
@@ -298,10 +372,36 @@ async def get_message_count(user_id: int) -> int:
         await conn.close()
 
 
+async def get_last_user_message(user_id: int) -> Optional[dict]:
+    """Последнее сообщение пользователя (для темы возвращения)."""
+    conn = await get_conn()
+    try:
+        row = await conn.fetchrow(
+            """SELECT content, created_at FROM conversations
+               WHERE user_id = $1 AND role = 'user'
+               ORDER BY created_at DESC LIMIT 1""",
+            user_id,
+        )
+        return dict(row) if row else None
+    finally:
+        await conn.close()
+
+
+async def update_last_topic_summary(user_id: int, summary: str):
+    """Сохраняет краткую сводку последней темы разговора."""
+    conn = await get_conn()
+    try:
+        await conn.execute(
+            "UPDATE users SET last_topic_summary = $1, updated_at = NOW() WHERE user_id = $2",
+            summary[:300], user_id,
+        )
+    finally:
+        await conn.close()
+
+
 # ─── Memory Facts ───
 
 async def save_memory_fact(user_id: int, fact_type: str, content: str, importance: int = 3):
-    """Сохраняет факт о пользователе в память (с дедупликацией)."""
     conn = await get_conn()
     try:
         existing = await conn.fetchval(
@@ -327,7 +427,6 @@ async def save_memory_fact(user_id: int, fact_type: str, content: str, importanc
 
 
 async def get_memory_facts(user_id: int, min_importance: int = 3) -> list[dict]:
-    """Возвращает важные факты о пользователе."""
     conn = await get_conn()
     try:
         rows = await conn.fetch(
@@ -341,20 +440,110 @@ async def get_memory_facts(user_id: int, min_importance: int = 3) -> list[dict]:
         await conn.close()
 
 
+# ─── Emotional Memory (НОВАЯ — концепция v2) ───
+
+async def save_emotional_memory(
+    user_id: int, memory_type: str, content: str, context: str = "", importance: int = 3
+):
+    """Сохраняет эмоциональный факт (главная боль, близкий человек, обещание...)."""
+    conn = await get_conn()
+    try:
+        # Дедупликация по типу и содержимому
+        existing = await conn.fetchval(
+            """SELECT id FROM emotional_memory
+               WHERE user_id = $1 AND memory_type = $2 AND content = $3""",
+            user_id, memory_type, content,
+        )
+        if existing:
+            await conn.execute(
+                """UPDATE emotional_memory
+                   SET importance = GREATEST(importance, $1), context = $2, updated_at = NOW()
+                   WHERE id = $3""",
+                importance, context, existing,
+            )
+        else:
+            await conn.execute(
+                """INSERT INTO emotional_memory (user_id, memory_type, content, context, importance)
+                   VALUES ($1, $2, $3, $4, $5)""",
+                user_id, memory_type, content, context, importance,
+            )
+    finally:
+        await conn.close()
+
+
+async def get_emotional_memory(user_id: int, min_importance: int = 3) -> list[dict]:
+    """Возвращает эмоциональные факты о пользователе."""
+    conn = await get_conn()
+    try:
+        rows = await conn.fetch(
+            """SELECT memory_type, content, context, importance FROM emotional_memory
+               WHERE user_id = $1 AND importance >= $2
+               ORDER BY importance DESC, updated_at DESC LIMIT 10""",
+            user_id, min_importance,
+        )
+        return [dict(r) for r in rows]
+    finally:
+        await conn.close()
+
+
+async def get_top_emotional_memory(user_id: int) -> Optional[dict]:
+    """Самый важный эмоциональный факт (для приветствия возвращения)."""
+    conn = await get_conn()
+    try:
+        row = await conn.fetchrow(
+            """SELECT memory_type, content, importance FROM emotional_memory
+               WHERE user_id = $1 ORDER BY importance DESC, updated_at DESC LIMIT 1""",
+            user_id,
+        )
+        return dict(row) if row else None
+    finally:
+        await conn.close()
+
+
+# ─── Free 1-card cooldown ───
+
+async def can_get_free_card(user_id: int, cooldown_hours: int = 24) -> bool:
+    conn = await get_conn()
+    try:
+        last = await conn.fetchval(
+            "SELECT last_free_card_at FROM users WHERE user_id = $1", user_id
+        )
+        if not last:
+            return True
+        if hasattr(last, "tzinfo") and last.tzinfo is None:
+            last = last.replace(tzinfo=timezone.utc)
+        diff = (datetime.now(timezone.utc) - last).total_seconds()
+        return diff >= cooldown_hours * 3600
+    finally:
+        await conn.close()
+
+
+async def mark_free_card_used(user_id: int):
+    conn = await get_conn()
+    try:
+        await conn.execute(
+            "UPDATE users SET last_free_card_at = NOW(), updated_at = NOW() WHERE user_id = $1",
+            user_id,
+        )
+    finally:
+        await conn.close()
+
+
 # ─── Rate Limiting (через БД, не в памяти) ───
 
 async def check_rate_limit(user_id: int, min_interval_seconds: float = 2.0) -> bool:
-    """Проверяет rate limit через БД. Возвращает True, если можно отправить сообщение."""
     conn = await get_conn()
     try:
         row = await conn.fetchrow(
             "SELECT last_message_at FROM rate_limits WHERE user_id = $1", user_id
         )
         if row:
-            from datetime import datetime, timezone
             last = row["last_message_at"]
             if last:
-                diff = (datetime.now(timezone.utc) - last).total_seconds()
+                from datetime import datetime as _dt, timezone as _tz
+                if hasattr(last, "tzinfo") and last.tzinfo is None:
+                    last = last.replace(tzinfo=_tz.utc)
+                diff = (_dt.now(_tz.utc) - last).total_seconds()
                 if diff < min_interval_seconds:
                     return False
         return True
@@ -363,7 +552,6 @@ async def check_rate_limit(user_id: int, min_interval_seconds: float = 2.0) -> b
 
 
 async def update_rate_limit(user_id: int):
-    """Обновляет время последнего сообщения."""
     conn = await get_conn()
     try:
         await conn.execute(
@@ -379,13 +567,13 @@ async def update_rate_limit(user_id: int):
 # ─── Admin ───
 
 async def get_user_stats() -> list[dict]:
-    """Статистика пользователей для админа."""
     conn = await get_conn()
     try:
         rows = await conn.fetch("""
             SELECT user_id, username, first_name, name,
                    crystals, state, message_count,
-                   rudeness_count, is_blocked, created_at
+                   rudeness_count, is_blocked, created_at, last_seen_at,
+                   onboarding_completed
             FROM users ORDER BY created_at DESC
         """)
         return [dict(r) for r in rows]

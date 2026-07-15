@@ -1,30 +1,26 @@
 """
 Логика памяти и извлечения фактов.
-Сборка контекста из БД для Gemini (8 последних сообщений + важные факты).
-Адаптировано под connection-per-request (database.py).
+Сборка контекста из БД для LLM (8 последних сообщений + важные факты + эмоциональная память).
+Концепция v2: эмоциональная память (главная боль, близкие, обещания, незакрытые вопросы).
 """
 import logging
 
 from bot import database as db
-from bot.gemini import extract_memory_facts
+from bot.gemini import extract_memory_facts, extract_emotional_memory
 
 logger = logging.getLogger(__name__)
 
 
 async def build_context(user_id: int) -> str:
-    """
-    Собирает полный контекст пользователя для Gemini.
-    """
+    """Собирает полный контекст пользователя для LLM."""
     try:
         user = await db.get_user(user_id)
         if not user:
             return ""
 
-        facts = await db.get_memory_facts(user_id, min_importance=3)
+        facts, emotional = await _gather_memory(user_id)
 
         parts = []
-
-        # Основная информация
         info_lines = []
         name = user.get("name") or user.get("first_name")
         if name:
@@ -50,7 +46,6 @@ async def build_context(user_id: int) -> str:
         if info_lines:
             parts.append("[Информация о пользователе]\n" + "\n".join(info_lines))
 
-        # Факты
         if facts:
             type_names = {
                 "pain": "Боль", "relationship": "Отношения", "work": "Дело",
@@ -63,11 +58,32 @@ async def build_context(user_id: int) -> str:
                 fact_lines.append(f"- {label}: {f['fact_content']}")
             parts.append("[Ключевые факты]\n" + "\n".join(fact_lines))
 
+        if emotional:
+            em_names = {
+                "main_pain": "Главная боль", "loved_one": "Близкий человек",
+                "promise": "Обещание (себе)", "unfinished_question": "Незакрытый вопрос",
+                "life_event": "Событие жизни", "fear": "Страх", "goal": "Цель",
+                "breakthrough": "Прорыв",
+            }
+            em_lines = []
+            for em in emotional[:5]:
+                label = em_names.get(em["memory_type"], em["memory_type"])
+                em_lines.append(f"- {label}: {em['content']}")
+            parts.append("[Эмоциональная память]\n" + "\n".join(em_lines))
+
         return "\n\n".join(parts)
 
     except Exception as e:
         logger.error(f"build_context error for user {user_id}: {e}")
         return ""
+
+
+async def _gather_memory(user_id: int):
+    """Параллельно получает facts и emotional (один запрос — два SELECT, но asyncpg не пулит)."""
+    import asyncio
+    facts_task = db.get_memory_facts(user_id, min_importance=3)
+    em_task = db.get_emotional_memory(user_id, min_importance=3)
+    return await asyncio.gather(facts_task, em_task)
 
 
 async def should_extract_facts(user_id: int) -> bool:
@@ -81,13 +97,17 @@ async def should_extract_facts(user_id: int) -> bool:
 
 
 async def extract_and_save_facts(user_id: int) -> None:
-    """Извлекает факты из последних сообщений и сохраняет в память."""
+    """Извлекает факты и эмоциональную память из последних сообщений и сохраняет."""
     try:
-        messages = await db.get_recent_messages(user_id, limit=6)
+        messages = await db.get_recent_messages(user_id, limit=8)
         if not messages:
             return
 
-        facts = await extract_memory_facts(messages)
+        import asyncio
+        facts, emotional = await asyncio.gather(
+            extract_memory_facts(messages),
+            extract_emotional_memory(messages),
+        )
 
         for fact in facts:
             await db.save_memory_fact(
@@ -97,8 +117,24 @@ async def extract_and_save_facts(user_id: int) -> None:
                 importance=min(5, max(1, int(fact.get("importance", 3)))),
             )
 
-        if facts:
-            logger.info(f"Saved {len(facts)} facts for user {user_id}")
+        for em in emotional:
+            await db.save_emotional_memory(
+                user_id=user_id,
+                memory_type=em.get("memory_type", "life_event"),
+                content=str(em.get("content", ""))[:500],
+                context="auto-extracted",
+                importance=min(5, max(1, int(em.get("importance", 3)))),
+            )
+
+        if facts or emotional:
+            logger.info(f"Saved {len(facts)} facts + {len(emotional)} emotional for user {user_id}")
+
+        # Сохраняем краткую сводку последней темы
+        if messages:
+            last_user_msgs = [m["content"][:80] for m in messages[-3:] if m["role"] == "user"]
+            if last_user_msgs:
+                summary = " | ".join(last_user_msgs[-2:])
+                await db.update_last_topic_summary(user_id, summary)
 
     except Exception as e:
         logger.error(f"extract_and_save_facts error for user {user_id}: {e}")
