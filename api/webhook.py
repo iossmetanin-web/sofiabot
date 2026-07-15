@@ -56,10 +56,54 @@ async def _ensure_initialized():
             logger.error(f"Database init error: {e}")
 
 
+async def _send_early_typing(update_data: dict) -> None:
+    """Отправляет chat_action=typing НЕМЕДЛЕННО, до полной инициализации бота.
+
+    Решает проблему cold-start задержки: на Vercel Python serverless
+    `_ensure_initialized()` + import modules может занимать 2-4 секунды,
+    в течение которых пользователь не видит реакции бота.
+
+    Используем прямой httpx-запрос к Telegram API (не зависит от _bot_app).
+    Если что-то пошло не так — тихо игнорируем (это лишь UX-улучшение).
+    """
+    try:
+        # Достаём chat_id из update
+        msg = update_data.get("message") or update_data.get("edited_message")
+        if not msg:
+            cb = update_data.get("callback_query")
+            if cb and cb.get("message"):
+                msg = cb["message"]
+        if not msg:
+            return
+        chat_id = msg.get("chat", {}).get("id")
+        if chat_id is None:
+            return
+
+        token = os.getenv("TELEGRAM_BOT_TOKEN", "")
+        if not token:
+            return
+
+        # Прямой запрос к Telegram API, без инициализации Application
+        import httpx
+        async with httpx.AsyncClient(timeout=3.0) as client:
+            await client.post(
+                f"https://api.telegram.org/bot{token}/sendChatAction",
+                json={"chat_id": chat_id, "action": "typing"},
+            )
+    except Exception:
+        # Это лишь UX-улучшение — не падаем, если не получилось
+        pass
+
+
 async def _process_request(update_data: dict):
     """Обрабатывает один запрос: инициализация + обработка update. Всё в одном event loop."""
     import time as _time
     _t0 = _time.monotonic()
+
+    # ─── Ранний typing — ДО инициализации бота ───
+    # Запускаем параллельно с _ensure_initialized, чтобы пользователь
+    # увидел «печатает...» сразу (в пределах ~500мс), а не через 2-4 секунды cold start.
+    typing_task = asyncio.create_task(_send_early_typing(update_data))
 
     await _ensure_initialized()
 
@@ -67,9 +111,17 @@ async def _process_request(update_data: dict):
     update = Update.de_json(update_data, _bot_app.bot)
     if update is None:
         logger.warning("Received None update, skipping")
+        typing_task.cancel()
         return
 
     await _bot_app.process_update(update)
+
+    # Ждём завершения typing-задачи (она уже должна была отправиться, но для надёжности)
+    try:
+        await asyncio.wait_for(typing_task, timeout=1.0)
+    except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
+        pass
+
     _elapsed = _time.monotonic() - _t0
     logger.info(f"[TIMING] Total request processing: {_elapsed:.2f}s")
 

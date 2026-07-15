@@ -41,6 +41,7 @@ from bot.fsm import (
     wants_deeper,
     wants_free_card,
     wants_card_of_day,
+    wants_reading,
     get_next_state,
     is_long_absence,
     infer_gender_from_name,
@@ -784,6 +785,37 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
     # ─── Карта дня (Round 5, в диалоге) ───
     if state == SofiaState.CONVERSATION and wants_card_of_day(text_lower):
         await _handle_card_of_day(update, user_id, user)
+        return
+
+    # ─── Конкретный тип расклада по триггеру (love/career/decision/small/full/horoscope) ───
+    if state == SofiaState.CONVERSATION:
+        reading_type_state = detect_reading_type(text_lower)
+        if reading_type_state is not None:
+            # Переводим в TARO_ASK_NUMBERS — там есть полная логика выбора типа и запроса чисел
+            await db.update_user_state(user_id, SofiaState.TARO_ASK_NUMBERS)
+            await _handle_taro_numbers(update, user_id, text_stripped, user)
+            return
+
+    # ─── Общий запрос «давай расклад / погадай» — показать меню раскладов ───
+    if state == SofiaState.CONVERSATION and wants_reading(text_lower):
+        crystals = user.get("crystals", 0)
+        name = user.get("name") or user.get("first_name") or "милый человек"
+        response = (
+            f"Хорошо, {name}. Карты сегодня особенно разговорчивы.\n\n"
+            f"Выбери, какой расклад тебе ближе — кнопкой ниже или напиши словами:\n\n"
+            f"❤️ Расклад на любовь — {config.TARO_LOVE_COST} 💎\n"
+            f"⚖️ Расклад на выбор — {config.TARO_DECISION_COST} 💎\n"
+            f"💼 Расклад на дело — {config.TARO_CAREER_COST} 💎\n"
+            f"🔮 Малый расклад (5 карт) — {config.TARO_SMALL_COST} 💎\n"
+            f"🃏 Полный расклад судьбы (20 карт) — {config.TARO_FULL_COST} 💎\n"
+            f"⭐ Персональный гороскоп — {config.HOROSCOPE_COST} 💎\n"
+            f"🗺️ Бесплатная карта — 0 💎\n\n"
+            f"У тебя сейчас {crystals} 💎."
+        )
+        await update.effective_message.reply_text(
+            response, reply_markup=_paid_reading_keyboard(crystals)
+        )
+        await db.save_message(user_id, "sofia", response, "reading_options")
         return
 
     # ─── Маршрутизация по состоянию FSM ───
