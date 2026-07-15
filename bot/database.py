@@ -61,6 +61,9 @@ async def init_db():
         await conn.execute('ALTER TABLE users ADD COLUMN IF NOT EXISTS referral_reward_given BOOLEAN DEFAULT FALSE')
         await conn.execute('ALTER TABLE users ADD COLUMN IF NOT EXISTS last_daily_horoscope_date DATE')
         await conn.execute('ALTER TABLE users ADD COLUMN IF NOT EXISTS daily_horoscope_opt_in BOOLEAN DEFAULT FALSE')
+        # Round 5 — карта дня и последний отправленный бродкаст
+        await conn.execute('ALTER TABLE users ADD COLUMN IF NOT EXISTS last_card_of_day_at TIMESTAMP')
+        await conn.execute('ALTER TABLE users ADD COLUMN IF NOT EXISTS last_broadcast_at TIMESTAMP')
 
         # ─── conversations ───
         await conn.execute('''
@@ -760,5 +763,102 @@ async def delete_user_data(user_id: int) -> bool:
             result = await conn.execute("DELETE FROM users WHERE user_id = $1", user_id)
             # result вида "DELETE 1" или "DELETE 0"
             return "1" in result.split()[-1] if result else False
+    finally:
+        await conn.close()
+
+
+# ─── Round 5: карта дня (cooldown) ───
+
+async def can_get_card_of_day(user_id: int, cooldown_hours: int = 20) -> bool:
+    """True, если пользователь может получить карту дня (прошёл cooldown)."""
+    conn = await get_conn()
+    try:
+        last = await conn.fetchval(
+            "SELECT last_card_of_day_at FROM users WHERE user_id = $1", user_id
+        )
+        if not last:
+            return True
+        if hasattr(last, "tzinfo") and last.tzinfo is None:
+            last = last.replace(tzinfo=timezone.utc)
+        diff = (datetime.now(timezone.utc) - last).total_seconds()
+        return diff >= cooldown_hours * 3600
+    finally:
+        await conn.close()
+
+
+async def mark_card_of_day_used(user_id: int):
+    conn = await get_conn()
+    try:
+        await conn.execute(
+            "UPDATE users SET last_card_of_day_at = NOW(), updated_at = NOW() WHERE user_id = $1",
+            user_id,
+        )
+    finally:
+        await conn.close()
+
+
+# ─── Round 5: дни рождения (для cron) ───
+
+async def get_birthday_users(limit: int = 10) -> list[dict]:
+    """Пользователи, у которых сегодня день рождения.
+    Сравниваем только месяц+день, игнорируя год.
+    Возвращает завершивших онбординг, не заблокированных."""
+    conn = await get_conn()
+    try:
+        rows = await conn.fetch("""
+            SELECT user_id, name, first_name, birth_date,
+                   EXTRACT(YEAR FROM birth_date) AS birth_year
+            FROM users
+            WHERE birth_date IS NOT NULL
+              AND onboarding_completed = TRUE
+              AND is_blocked = FALSE
+              AND EXTRACT(MONTH FROM birth_date) = EXTRACT(MONTH FROM CURRENT_DATE)
+              AND EXTRACT(DAY FROM birth_date) = EXTRACT(DAY FROM CURRENT_DATE)
+            ORDER BY user_id
+            LIMIT $1
+        """, limit)
+        return [dict(r) for r in rows]
+    finally:
+        await conn.close()
+
+
+# ─── Round 5: рассылка администратора ───
+
+async def get_broadcast_recipients(batch_size: int = 25, offset: int = 0) -> list[int]:
+    """Получает батч user_id для рассылки (не заблокированные, завершившие онбординг).
+    Пагинация через offset — для последовательной обработки."""
+    conn = await get_conn()
+    try:
+        rows = await conn.fetch("""
+            SELECT user_id FROM users
+            WHERE is_blocked = FALSE
+              AND onboarding_completed = TRUE
+            ORDER BY user_id
+            LIMIT $1 OFFSET $2
+        """, batch_size, offset)
+        return [r["user_id"] for r in rows]
+    finally:
+        await conn.close()
+
+
+async def count_broadcast_recipients() -> int:
+    """Считает всех получателей рассылки."""
+    conn = await get_conn()
+    try:
+        return await conn.fetchval(
+            "SELECT COUNT(*) FROM users WHERE is_blocked = FALSE AND onboarding_completed = TRUE"
+        ) or 0
+    finally:
+        await conn.close()
+
+
+async def mark_broadcast_sent(user_id: int):
+    """Отмечает, что пользователь получил последний бродкаст."""
+    conn = await get_conn()
+    try:
+        await conn.execute(
+            "UPDATE users SET last_broadcast_at = NOW() WHERE user_id = $1",
+            user_id,
+        )
     finally:
         await conn.close()

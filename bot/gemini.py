@@ -683,6 +683,165 @@ async def generate_taro_reading(name: str, question: str, numbers: list[int],
     return await _llm_call(contents, timeout=10.0)
 
 
+# ──────────────────────── Round 5: тематические расклады ────────────────────────
+
+THEMATIC_SPREADS = {
+    "love": {
+        "title": "расклад на любовь",
+        "positions": [
+            "1. Ты в отношениях — что несёшь",
+            "2. Партнёр (или тот, кто рядом) — что несёт",
+            "3. Между вами — связующая нить",
+        ],
+        "focus": "любовь, чувства, привязанность, сердце",
+    },
+    "career": {
+        "title": "расклад на дело",
+        "positions": [
+            "1. Где ты сейчас — точка на пути",
+            "2. Что тебя питает в деле",
+            "3. Что мешает расти",
+            "4. Какая возможность рядом",
+            "5. Совет карт — куда направить усилия",
+        ],
+        "focus": "работа, призвание, деньги, реализация",
+    },
+    "decision": {
+        "title": "расклад на выбор",
+        "positions": [
+            "1. Если выберешь один путь — куда он ведёт",
+            "2. Если выберешь другой путь — куда он ведёт",
+            "3. Что важно понять сердцем, чтобы решение пришло",
+        ],
+        "focus": "решение, выбор, развилка, сомнение",
+    },
+}
+
+
+async def generate_thematic_reading(
+    name: str, question: str, numbers: list[int],
+    spread_type: str, card_names: dict[int, str] = None
+) -> str:
+    """Тематический расклад Таро: love (3 карты), career (5 карт), decision (3 карты).
+    spread_type: 'love' | 'career' | 'decision'."""
+    spread = THEMATIC_SPREADS.get(spread_type)
+    if not spread:
+        # fallback на малый расклад
+        return await generate_taro_reading(name, question, numbers, full=False, card_names=card_names)
+
+    positions = spread["positions"]
+    count = len(positions)
+    pos_text = "\n".join(positions)
+
+    cards_info = []
+    for i, n in enumerate(numbers[:count]):
+        cname = card_names.get(n, f"Карта #{n}") if card_names else f"Карта #{n}"
+        cards_info.append(f"  {positions[i].split(' — ')[0]}: число {n} → {cname}")
+    cards_text = "\n".join(cards_info)
+
+    prompt = f"""Сделай {spread["title"]} для {name}.
+Тема вопроса: {question or spread["focus"]}
+
+Выбранные числа и карты:
+{cards_text}
+
+Позиции карт:
+{pos_text}
+
+Интерпретируй карты в контексте темы «{spread["focus"]}».
+Используй реальные имена карт. Дай образное, тёплое толкование — как мудрая бабушка, которая видит глубже.
+Свяжи карты в единую историю, не перечисляй механически.
+В конце дай мягкий совет и задай вопрос, который поможет человеку увидеть свой следующий шаг.
+
+Нравственный кодекс: никаких точных дат, никаких категоричных предсказаний болезней/смерти/разрывов. «Вероятный путь», «обрати внимание», «есть риск, что...»."""
+
+    contents = [
+        {"role": "user", "parts": [{"text": SYSTEM_PROMPT}]},
+        {"role": "model", "parts": [{"text": "Поняла. Я готова делать тематический расклад как София."}]},
+        {"role": "user", "parts": [{"text": prompt}]},
+    ]
+    return await _llm_call(contents, timeout=10.0)
+
+
+# ──────────────────────── Round 5: карта дня ────────────────────────
+
+async def generate_card_of_day(
+    name: str, zodiac: str = "", emotional: list[dict] = None
+) -> str:
+    """Карта дня — ежедневная практика через одну карту Таро.
+    Отличается от бесплатной 1-карты: фокус на дне, а не на «что важно понять сейчас».
+    Возвращает сообщение с именем карты и трактовкой для этого дня."""
+    from datetime import datetime
+    today_str = datetime.now().strftime("%d %B %Y")
+    import random
+    card_num = random.randint(1, 78)
+    from bot.fsm import get_tarot_card_name
+    card_name = get_tarot_card_name(card_num)
+
+    zodiac_line = f"\nЗнак зодиака: {zodiac}" if zodiac else ""
+    em_lines = ""
+    if emotional:
+        em_lines = "\nЭмоциональная память:\n" + "\n".join(
+            f"- {em.get('memory_type','?')}: {em.get('content','')}" for em in emotional[:2]
+        )
+
+    prompt = f"""Сегодня {today_str}. Пользователя зовут {name}.{zodiac_line}{em_lines}
+
+Человек вытянул карту дня. Номер карты: {card_num} → имя карты: «{card_name}».
+
+Напиши «карту дня» от лица Софии — это ежедневная мини-практика:
+1. Назови карту по имени (без номера).
+2. Дай короткое толкование того, какой смысл несёт эта карта именно сегодня (3-4 предложения).
+3. Предложи одну маленькую практику или вопрос для размышления на день.
+
+Тон: тёплая бабушка, которая хочет, чтобы день прошёл осознанно. Не длинно — 5-7 предложений всего.
+В конце: «🃏 Карта дня: {card_name}»"""
+
+    contents = [
+        {"role": "user", "parts": [{"text": SYSTEM_PROMPT}]},
+        {"role": "model", "parts": [{"text": "Поняла. Я готова дать карту дня как София."}]},
+        {"role": "user", "parts": [{"text": prompt}]},
+    ]
+    return await _llm_call(contents, timeout=8.0)
+
+
+# ──────────────────────── Round 5: поздравление с днём рождения ────────────────────────
+
+async def generate_birthday_greeting(
+    name: str, age: int = None, zodiac: str = "", emotional: list[dict] = None
+) -> str:
+    """Особое поздравление с днём рождения от Софии.
+    Отправляется автоматически через cron в день рождения пользователя."""
+    from datetime import datetime
+    today_str = datetime.now().strftime("%d %B %Y")
+    age_line = f"\nСегодня исполнилось {age} лет." if age else ""
+    zodiac_line = f"\nЗнак зодиака: {zodiac}" if zodiac else ""
+    em_lines = ""
+    if emotional:
+        em_lines = "\nЧто я помню о тебе:\n" + "\n".join(
+            f"- {em.get('memory_type','?')}: {em.get('content','')}" for em in emotional[:3]
+        )
+
+    prompt = f"""Сегодня {today_str}, и у {name} день рождения.{age_line}{zodiac_line}{em_lines}
+
+Напиши тёплое, искреннее поздравление от лица Софии — мудрой бабушки-хранительницы.
+Это не формальное «с днём рождения», а живое слово от того, кто знает человека:
+— отметь пройденный путь (даже если знаешь мало — образно, через метафору сезона/пути)
+— пожелай того, что резонирует с тем, что ты знаешь о человеке
+— добавь один «мудрый» совет на год вперёд — коротко, образно
+— заверши тёплым словом
+
+Длина: 6-10 предложений. Не используй штампы вроде «счастья здоровья любви».
+Подпись в конце: «🌙 Твоя София»"""
+
+    contents = [
+        {"role": "user", "parts": [{"text": SYSTEM_PROMPT}]},
+        {"role": "model", "parts": [{"text": "Поняла. Я готова поздравить с днём рождения как София."}]},
+        {"role": "user", "parts": [{"text": prompt}]},
+    ]
+    return await _llm_call(contents, timeout=8.0)
+
+
 # ──────────────────────── Гороскоп ────────────────────────
 
 async def generate_horoscope(

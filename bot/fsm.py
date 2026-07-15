@@ -28,9 +28,13 @@ class SofiaState(str, Enum):
     TARO_ASK_NUMBERS = "TARO_ASK_NUMBERS"    # Бот просит числа для расклада
     TARO_SMALL = "TARO_SMALL"               # Малый расклад (5 карт)
     TARO_FULL = "TARO_FULL"                  # Полный расклад (20 карт)
+    TARO_LOVE = "TARO_LOVE"                  # Round 5: расклад на любовь (3 карты)
+    TARO_CAREER = "TARO_CAREER"              # Round 5: расклад на дело (5 карт)
+    TARO_DECISION = "TARO_DECISION"          # Round 5: расклад на выбор (3 карты)
     HOROSCOPE = "HOROSCOPE"                  # Персональный гороскоп
     BLOCKED = "BLOCKED"                      # Блокировка за грубость
     AWAITING_DELETE_CONFIRM = "AWAITING_DELETE_CONFIRM"  # GDPR: ожидание подтверждения удаления
+    BROADCAST = "BROADCAST"                  # Round 5: админ пишет текст рассылки
 
 
 # Текстовые триггеры для особых команд (без кнопок!)
@@ -52,6 +56,26 @@ FREE_CARD_TRIGGERS = {
 TARO_SMALL_TRIGGERS = {"малый", "малый расклад", "5 карт", "пять карт", "1 кристалл"}
 TARO_FULL_TRIGGERS = {"полный", "полный расклад", "20 карт", "двадцать карт", "3 кристалла"}
 HOROSCOPE_TRIGGERS = {"гороскоп", "зодиак", "2 кристалла"}
+
+# Round 5: новые тематические расклады
+TARO_LOVE_TRIGGERS = {
+    "расклад на любовь", "на любовь", "любовь", "отношения",
+    "расклад на отношения", "сердце", "он она", "партнёр",
+}
+TARO_CAREER_TRIGGERS = {
+    "расклад на дело", "на дело", "карьера", "работа", "дело",
+    "расклад на работу", "бизнес", "профессия", "деньги",
+}
+TARO_DECISION_TRIGGERS = {
+    "расклад на выбор", "на выбор", "выбор", "да нет",
+    "что выбрать", "как решить", "решение", "или",
+}
+
+# Round 5: карта дня
+CARD_OF_DAY_TRIGGERS = {
+    "карта дня", "карта на день", "карта сегодняшнего дня",
+    "сегодняшняя карта", "карту дня",
+}
 
 # Триггеры «узнать полностью / открыть глубже» (после хука)
 DEEPER_TRIGGERS = {
@@ -82,13 +106,25 @@ def is_rude(text: str) -> bool:
 def detect_reading_type(text: str) -> SofiaState | None:
     """Определяет тип расклада по текстовому триггеру."""
     text_lower = text.lower().strip()
-    if any(t in text_lower for t in TARO_SMALL_TRIGGERS):
-        return SofiaState.TARO_SMALL
     if any(t in text_lower for t in TARO_FULL_TRIGGERS):
         return SofiaState.TARO_FULL
+    if any(t in text_lower for t in TARO_SMALL_TRIGGERS):
+        return SofiaState.TARO_SMALL
     if any(t in text_lower for t in HOROSCOPE_TRIGGERS):
         return SofiaState.HOROSCOPE
+    if any(t in text_lower for t in TARO_LOVE_TRIGGERS):
+        return SofiaState.TARO_LOVE
+    if any(t in text_lower for t in TARO_CAREER_TRIGGERS):
+        return SofiaState.TARO_CAREER
+    if any(t in text_lower for t in TARO_DECISION_TRIGGERS):
+        return SofiaState.TARO_DECISION
     return None
+
+
+def wants_card_of_day(text: str) -> bool:
+    """Проверяет, просит ли пользователь «карту дня» (Round 5)."""
+    text_lower = text.lower().strip()
+    return any(t in text_lower for t in CARD_OF_DAY_TRIGGERS)
 
 
 def wants_deeper(text: str) -> bool:

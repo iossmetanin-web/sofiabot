@@ -26,6 +26,10 @@
     {
       "src": "/api/cron/checkin",
       "dest": "api/webhook.py"
+    },
+    {
+      "src": "/api/cron/birthday",
+      "dest": "api/webhook.py"
     }
   ],
   "crons": [
@@ -36,6 +40,10 @@
     {
       "path": "/api/cron/checkin",
       "schedule": "0 15 */3 * *"
+    },
+    {
+      "path": "/api/cron/birthday",
+      "schedule": "0 9 * * *"
     }
   ]
 }

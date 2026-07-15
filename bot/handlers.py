@@ -40,6 +40,7 @@ from bot.fsm import (
     detect_reading_type,
     wants_deeper,
     wants_free_card,
+    wants_card_of_day,
     get_next_state,
     is_long_absence,
     infer_gender_from_name,
@@ -59,8 +60,11 @@ from bot.gemini import (
     generate_response,
     generate_fate_card,
     generate_taro_reading,
+    generate_thematic_reading,
     generate_horoscope,
     generate_single_card,
+    generate_card_of_day,
+    generate_birthday_greeting,
     generate_probing_question,
     generate_return_greeting,
     generate_daily_horoscope,
@@ -126,6 +130,23 @@ async def _safe_reply(update: Update, text: str, reply_markup: InlineKeyboardMar
 def _paid_reading_keyboard(crystals: int) -> InlineKeyboardMarkup:
     """Клавиатура выбора расклада."""
     buttons = []
+    # Тематические расклады (Round 5) — компактнее, дешевле
+    thematic_row = []
+    if crystals >= config.TARO_LOVE_COST:
+        thematic_row.append(InlineKeyboardButton(
+            f"❤️ Любовь {config.TARO_LOVE_COST}💎", callback_data="reading:love"
+        ))
+    if crystals >= config.TARO_DECISION_COST:
+        thematic_row.append(InlineKeyboardButton(
+            f"⚖️ Выбор {config.TARO_DECISION_COST}💎", callback_data="reading:decision"
+        ))
+    if thematic_row:
+        buttons.append(thematic_row)
+    if crystals >= config.TARO_CAREER_COST:
+        buttons.append([InlineKeyboardButton(
+            f"💼 Дело {config.TARO_CAREER_COST}💎", callback_data="reading:career"
+        )])
+    # Классические расклады
     if crystals >= config.TARO_SMALL_COST:
         buttons.append([InlineKeyboardButton(
             f"🔮 Малый расклад (5 карт) — {config.TARO_SMALL_COST}💎", callback_data="reading:small"
@@ -139,6 +160,7 @@ def _paid_reading_keyboard(crystals: int) -> InlineKeyboardMarkup:
             f"⭐ Персональный гороскоп — {config.HOROSCOPE_COST}💎", callback_data="reading:horoscope"
         )])
     buttons.append([InlineKeyboardButton("🔮 Бесплатная карта", callback_data="reading:free_card")])
+    buttons.append([InlineKeyboardButton("🃏 Карта дня", callback_data="reading:card_of_day")])
     buttons.append([InlineKeyboardButton("Открыть глубже", callback_data="reading:deeper")])
     return InlineKeyboardMarkup(buttons)
 
@@ -565,6 +587,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "🌙 Я — София. Вот что я умею:\n\n"
         "💬 Просто пиши — и мы поговорим\n"
         "🌅 /today — послание дня (бесплатно, раз в день)\n"
+        "🃏 /card_of_day — карта дня (раз в 20 часов)\n"
         "💚 /mood — я спрошу, как ты (с заботой)\n"
         "📜 /profile — твоя карточка\n"
         "💎 /balance — сколько кристаллов\n"
@@ -575,6 +598,9 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "🔄 /reset — начать разговор заново (если застрял)\n"
         "🚪 /delete_my_data — стереть все наши разговоры\n\n"
         "─── Расклады ───\n"
+        f"❤️ «расклад на любовь» — 3 карты ({config.TARO_LOVE_COST} 💎)\n"
+        f"⚖️ «расклад на выбор» — 3 карты ({config.TARO_DECISION_COST} 💎)\n"
+        f"💼 «расклад на дело» — 5 карт ({config.TARO_CAREER_COST} 💎)\n"
         f"🔮 «малый расклад» — 5 карт ({config.TARO_SMALL_COST} 💎)\n"
         f"🃏 «полный расклад» — 20 карт ({config.TARO_FULL_COST} 💎)\n"
         f"⭐ «гороскоп» — персональный ({config.HOROSCOPE_COST} 💎)\n"
@@ -697,6 +723,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await _handle_free_card(update, user_id, user)
         return
 
+    # ─── Карта дня (Round 5, в диалоге) ───
+    if state == SofiaState.CONVERSATION and wants_card_of_day(text_lower):
+        await _handle_card_of_day(update, user_id, user)
+        return
+
     # ─── Маршрутизация по состоянию FSM ───
     try:
         if state == SofiaState.ASK_NAME:
@@ -715,12 +746,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             await _handle_conversation(update, user_id, text_stripped, user)
         elif state == SofiaState.TARO_ASK_NUMBERS:
             await _handle_taro_numbers(update, user_id, text_stripped, user)
-        elif state in (SofiaState.TARO_SMALL, SofiaState.TARO_FULL):
+        elif state in (SofiaState.TARO_SMALL, SofiaState.TARO_FULL,
+                        SofiaState.TARO_LOVE, SofiaState.TARO_CAREER, SofiaState.TARO_DECISION):
             await _handle_paid_reading(update, user_id, text_stripped, user, state)
         elif state == SofiaState.HOROSCOPE:
             await _handle_horoscope_state(update, user_id, text_stripped, user)
         elif state == SofiaState.PAID_HOOK:
             await _handle_paid_hook_response(update, user_id, text_stripped, user)
+        elif state == SofiaState.BROADCAST:
+            await _handle_broadcast(update, user_id, text_stripped, user)
         elif state == SofiaState.BLOCKED:
             await update.effective_message.reply_text(
                 "Я пока не готова продолжать разговор. Если хочешь поговорить спокойно — скажи «извини»."
@@ -1040,8 +1074,14 @@ async def _handle_paid_hook_response(update: Update, user_id: int, text: str, us
         crystals = user.get("crystals", 0)
         response = (
             "Хорошо. Чтобы заглянуть глубже, мне нужны карты. Вот что я могу предложить:\n\n"
+            f"❤️ Расклад на любовь (3 карты) — {config.TARO_LOVE_COST} 💎\n"
+            f"   Ты, партнёр, связующая нить.\n\n"
+            f"⚖️ Расклад на выбор (3 карты) — {config.TARO_DECISION_COST} 💎\n"
+            f"   Два пути и то, что важно понять сердцем.\n\n"
+            f"💼 Расклад на дело (5 карт) — {config.TARO_CAREER_COST} 💎\n"
+            f"   Где ты сейчас, что питает, что мешает, возможность, совет.\n\n"
             f"🔮 Малый расклад (5 карт) — {config.TARO_SMALL_COST} 💎\n"
-            f"   Откроет текущую ситуацию, скрытое, помехи, помощь и направление.\n\n"
+            f"   Текущая ситуация, скрытое, помехи, помощь, направление.\n\n"
             f"🃏 Полный расклад судьбы (20 карт) — {config.TARO_FULL_COST} 💎\n"
             f"   Глубокий взгляд на все стороны жизни.\n\n"
             f"⭐ Персональный гороскоп — {config.HOROSCOPE_COST} 💎\n"
@@ -1077,11 +1117,14 @@ async def _handle_taro_numbers(update: Update, user_id: int, text: str, user: di
         crystals = user.get("crystals", 0)
         response = (
             "Чтобы заглянуть глубже, мне нужны карты. Вот что я могу предложить:\n\n"
+            f"❤️ Расклад на любовь (3 карты) — {config.TARO_LOVE_COST} 💎\n"
+            f"⚖️ Расклад на выбор (3 карты) — {config.TARO_DECISION_COST} 💎\n"
+            f"💼 Расклад на дело (5 карт) — {config.TARO_CAREER_COST} 💎\n"
             f"🔮 Малый расклад (5 карт) — {config.TARO_SMALL_COST} 💎\n"
             f"🃏 Полный расклад (20 карт) — {config.TARO_FULL_COST} 💎\n"
             f"⭐ Гороскоп — {config.HOROSCOPE_COST} 💎\n"
             f"🗺️ Бесплатная карта — 0 💎\n\n"
-            f"У тебя сейчас {crystals} 💎. Выбери кнопкой ниже или напиши: «малый», «полный», «гороскоп»."
+            f"У тебя сейчас {crystals} 💎. Выбери кнопкой ниже или напиши: «любовь», «выбор», «дело», «малый», «полный», «гороскоп»."
         )
         await update.effective_message.reply_text(response, reply_markup=_paid_reading_keyboard(crystals))
         await db.save_message(user_id, "sofia", response, "reading_options")
@@ -1092,22 +1135,28 @@ async def _handle_taro_numbers(update: Update, user_id: int, text: str, user: di
         await _handle_free_card(update, user_id, user)
         return
 
+    # Карта дня по тексту
+    if wants_card_of_day(text_lower):
+        await _handle_card_of_day(update, user_id, user)
+        return
+
     # Выбрал тип расклада
     if reading_type_state:
         if reading_type_state == SofiaState.HOROSCOPE:
             await _execute_horoscope(update, user_id, user)
             return
 
-        if reading_type_state == SofiaState.TARO_SMALL:
-            cost = config.TARO_SMALL_COST
-            card_count = 5
-            type_name = "Малый расклад"
-            reading_type_str = "small"
-        else:  # TARO_FULL
-            cost = config.TARO_FULL_COST
-            card_count = 20
-            type_name = "Полный расклад"
-            reading_type_str = "full"
+        # Параметры по типу расклада
+        spread_params = {
+            SofiaState.TARO_SMALL:    (config.TARO_SMALL_COST, 5, "Малый расклад", "small"),
+            SofiaState.TARO_FULL:     (config.TARO_FULL_COST, 20, "Полный расклад", "full"),
+            SofiaState.TARO_LOVE:     (config.TARO_LOVE_COST, 3, "Расклад на любовь", "love"),
+            SofiaState.TARO_CAREER:   (config.TARO_CAREER_COST, 5, "Расклад на дело", "career"),
+            SofiaState.TARO_DECISION: (config.TARO_DECISION_COST, 3, "Расклад на выбор", "decision"),
+        }
+        if reading_type_state not in spread_params:
+            return
+        cost, card_count, type_name, reading_type_str = spread_params[reading_type_state]
 
         crystals = user.get("crystals", 0)
         if crystals < cost:
@@ -1151,20 +1200,28 @@ async def _handle_taro_numbers(update: Update, user_id: int, text: str, user: di
 
 
 async def _handle_paid_reading(update: Update, user_id: int, text: str, user: dict, state: str) -> None:
-    """Состояния TARO_SMALL / TARO_FULL — ожидание чисел."""
+    """Состояния TARO_SMALL / TARO_FULL / TARO_LOVE / TARO_CAREER / TARO_DECISION — ожидание чисел."""
     numbers = _parse_numbers(text)
 
+    # Параметры по типу расклада
     if state == SofiaState.TARO_SMALL:
-        needed = 5
-        full = False
-        cost = config.TARO_SMALL_COST
+        needed, full, cost, spread_type = 5, False, config.TARO_SMALL_COST, None
+    elif state == SofiaState.TARO_FULL:
+        needed, full, cost, spread_type = 20, True, config.TARO_FULL_COST, None
+    elif state == SofiaState.TARO_LOVE:
+        needed, full, cost, spread_type = 3, False, config.TARO_LOVE_COST, "love"
+    elif state == SofiaState.TARO_CAREER:
+        needed, full, cost, spread_type = 5, False, config.TARO_CAREER_COST, "career"
+    elif state == SofiaState.TARO_DECISION:
+        needed, full, cost, spread_type = 3, False, config.TARO_DECISION_COST, "decision"
     else:
-        needed = 20
-        full = True
-        cost = config.TARO_FULL_COST
+        needed, full, cost, spread_type = 5, False, config.TARO_SMALL_COST, None
 
     if len(numbers) >= needed:
-        await _execute_taro_reading(update, user_id, user, numbers[:needed], full, cost)
+        if spread_type:
+            await _execute_thematic_reading(update, user_id, user, numbers[:needed], spread_type, cost)
+        else:
+            await _execute_taro_reading(update, user_id, user, numbers[:needed], full, cost)
     else:
         response = (
             f"Мне нужно {needed} чисел от 1 до {config.MAX_TARO_NUMBER}. "
@@ -1263,6 +1320,159 @@ async def _execute_taro_reading(update: Update, user_id: int, user: dict,
     await db.update_user_profile(user_id, reading_type=None)
 
 
+# ─── Round 5: тематический расклад (любовь/дело/выбор) ───
+
+THEMATIC_LABELS = {
+    "love": ("❤️ Расклад на любовь", "thematic_love"),
+    "career": ("💼 Расклад на дело", "thematic_career"),
+    "decision": ("⚖️ Расклад на выбор", "thematic_decision"),
+}
+
+
+async def _execute_thematic_reading(update: Update, user_id: int, user: dict,
+                                     numbers: list[int], spread_type: str, cost: int) -> None:
+    """Исполняет тематический расклад Таро (love/career/decision) с реальными именами карт."""
+    label, msg_tag = THEMATIC_LABELS.get(spread_type, ("🔮 Тематический расклад", "thematic"))
+
+    success = await db.spend_crystals(user_id, cost, label)
+    if not success:
+        crystals = await db.get_user_crystals(user_id)
+        response = (
+            f"Не хватает кристаллов. У тебя {crystals} 💎, нужно {cost} 💎. "
+            f"Обратись к администратору."
+        )
+        await update.effective_message.reply_text(response)
+        await db.save_message(user_id, "sofia", response, "insufficient_crystals")
+        await db.update_user_state(user_id, SofiaState.CONVERSATION)
+        return
+
+    recent = await db.get_recent_messages(user_id, limit=4)
+    topic_parts = [m["content"][:80] for m in recent if m["role"] == "user"]
+    topic = " | ".join(topic_parts[-3:]) if topic_parts else "общий вопрос"
+
+    name = user.get("name") or user.get("first_name") or "милый человек"
+    card_names = {n: get_tarot_card_name(n) for n in numbers}
+
+    await update.effective_message.reply_text("🗺️ Раскладываю карты... Дай мне минутку.")
+
+    reading = await generate_thematic_reading(
+        name=name,
+        question=topic,
+        numbers=numbers,
+        spread_type=spread_type,
+        card_names=card_names,
+    )
+
+    await db.save_message(user_id, "sofia", reading, msg_tag)
+    await _send_long_message(update, f"{label}\n\n{reading}")
+    await db.update_user_state(user_id, SofiaState.CONVERSATION)
+    await db.update_user_profile(user_id, reading_type=None)
+
+
+# ─── Round 5: карта дня ───
+
+async def _handle_card_of_day(update: Update, user_id: int, user: dict) -> None:
+    """Карта дня — ежедневная мини-практика через одну карту Таро. Cooldown 20ч."""
+    can = await db.can_get_card_of_day(user_id, config.CARD_OF_DAY_COOLDOWN_HOURS)
+    if not can:
+        response = (
+            f"Карту дня я уже для тебя сегодня открывала. "
+            f"Следующая будет доступна через {config.CARD_OF_DAY_COOLDOWN_HOURS} часов. "
+            f"А пока — давай просто поговорим, или загляни в /today."
+        )
+        await update.effective_message.reply_text(response)
+        await db.save_message(user_id, "sofia", response, "card_of_day_cooldown")
+        await db.update_user_state(user_id, SofiaState.CONVERSATION)
+        return
+
+    name = user.get("name") or user.get("first_name") or "милый человек"
+    zodiac = _get_zodiac_from_user(user)
+
+    await update.effective_message.reply_text("🃏 Тяну для тебя карту дня... Дай минутку.")
+
+    try:
+        emotional = await db.get_emotional_memory(user_id, min_importance=2)
+        card_msg = await generate_card_of_day(name=name, zodiac=zodiac, emotional=emotional)
+        await db.mark_card_of_day_used(user_id)
+        await db.save_message(user_id, "sofia", card_msg, "card_of_day")
+        await _send_long_message(update, card_msg)
+    except Exception as e:
+        logger.error(f"Card of day error for {user_id}: {e}", exc_info=True)
+        fallback = (
+            f"Сегодня туман густой, {name}, не могу разглядеть карту. "
+            f"Попробуй ещё раз чуть позже."
+        )
+        await update.effective_message.reply_text(fallback)
+        await db.save_message(user_id, "sofia", fallback, "card_of_day_error")
+
+    await db.update_user_state(user_id, SofiaState.CONVERSATION)
+
+
+# ─── Round 5: рассылка администратора ───
+
+async def _handle_broadcast(update: Update, user_id: int, text: str, user: dict) -> None:
+    """Состояние BROADCAST — админ написал текст для рассылки.
+    Если «отмена» — выходим без рассылки."""
+    text_stripped = text.strip()
+
+    if text_stripped.lower() in ("отмена", "cancel", "/cancel", "/отмена"):
+        await db.update_user_state(user_id, SofiaState.CONVERSATION)
+        await update.effective_message.reply_text("📢 Рассылка отменена.")
+        return
+
+    if len(text_stripped) < 3:
+        await update.effective_message.reply_text("Слишком короткий текст. Напиши подробнее или «отмена».")
+        return
+
+    # Считаем получателей и предупреждаем о лимите serverless
+    total = await db.count_broadcast_recipients()
+    await update.effective_message.reply_text(
+        f"📢 Начинаю рассылку. Получателей: {total}. "
+        f"Отправляю батчами по {config.BROADCAST_BATCH}..."
+    )
+
+    import asyncio as _aio
+    sent = 0
+    failed = 0
+    offset = 0
+    bot = update.get_bot()
+
+    while True:
+        batch = await db.get_broadcast_recipients(config.BROADCAST_BATCH, offset)
+        if not batch:
+            break
+
+        for recipient_id in batch:
+            try:
+                await bot.send_message(chat_id=recipient_id, text=text_stripped)
+                await db.mark_broadcast_sent(recipient_id)
+                sent += 1
+            except Exception as e:
+                failed += 1
+                logger.warning(f"Broadcast to {recipient_id} failed: {e}")
+
+            # Telegram rate limit ~30 msg/sec
+            await _aio.sleep(config.BROADCAST_RATE_MS / 1000.0)
+
+        offset += config.BROADCAST_BATCH
+
+        # Сохраняем в историю как сообщение Софии (одно, от имени админа)
+        await db.save_message(user_id, "sofia", f"[РАССЫЛКА] {text_stripped}", "admin_broadcast")
+
+        # Если вышли за разумный предел serverless (Vercel ~10-60s) — прерываем
+        if offset >= 500:
+            await update.effective_message.reply_text(
+                f"⚠️ Достигнут лимит 500 сообщений за запуск. Отправлено: {sent}. "
+                f"Остальным досылай следующей командой /broadcast."
+            )
+            break
+
+    await db.update_user_state(user_id, SofiaState.CONVERSATION)
+    await update.effective_message.reply_text(
+        f"✅ Рассылка завершена. Отправлено: {sent}, ошибок: {failed}."
+    )
+
+
 async def _execute_horoscope(update: Update, user_id: int, user: dict) -> None:
     """Исполняет гороскоп."""
     cost = config.HOROSCOPE_COST
@@ -1328,10 +1538,18 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await _start_reading_flow(update, user_id, user, SofiaState.TARO_SMALL, "small", 5, config.TARO_SMALL_COST, "Малый расклад")
     elif data == "reading:full":
         await _start_reading_flow(update, user_id, user, SofiaState.TARO_FULL, "full", 20, config.TARO_FULL_COST, "Полный расклад")
+    elif data == "reading:love":
+        await _start_reading_flow(update, user_id, user, SofiaState.TARO_LOVE, "love", 3, config.TARO_LOVE_COST, "Расклад на любовь")
+    elif data == "reading:career":
+        await _start_reading_flow(update, user_id, user, SofiaState.TARO_CAREER, "career", 5, config.TARO_CAREER_COST, "Расклад на дело")
+    elif data == "reading:decision":
+        await _start_reading_flow(update, user_id, user, SofiaState.TARO_DECISION, "decision", 3, config.TARO_DECISION_COST, "Расклад на выбор")
     elif data == "reading:horoscope":
         await _execute_horoscope(update, user_id, user)
     elif data == "reading:free_card":
         await _handle_free_card(update, user_id, user)
+    elif data == "reading:card_of_day":
+        await _handle_card_of_day(update, user_id, user)
     elif data == "reading:deeper":
         crystals = user.get("crystals", 0)
         response = (
@@ -1367,7 +1585,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     elif data == "admin:broadcast_prompt":
         if user_id == config.ADMIN_ID:
             await _safe_reply(update, "📢 Напиши текст рассылки, и я отправлю его всем пользователям. Для отмены напиши «отмена».")
-            await db.update_user_state(user_id, SofiaState.CONVERSATION)  # TODO: add BROADCAST state
+            await db.update_user_state(user_id, SofiaState.BROADCAST)
 
 
 async def _start_reading_flow(update: Update, user_id: int, user: dict,
@@ -1425,6 +1643,7 @@ async def _show_menu(update: Update, user: dict) -> None:
         f"📋 Вот что можно сделать, {name}:{zodiac_line}\n\n"
         f"💬 Просто пиши — и мы поговорим\n"
         f"🌅 /today — послание дня (бесплатно)\n"
+        f"🃏 /card_of_day — карта дня\n"
         f"💚 /mood — я спрошу, как ты\n"
         f"📊 «профиль» — твоя карточка\n"
         f"💎 «баланс» — сколько кристаллов\n"
@@ -1434,6 +1653,9 @@ async def _show_menu(update: Update, user: dict) -> None:
         f"🌅 /subscribe — утренние весточки\n"
         f"🔄 /reset — начать заново\n\n"
         f"─── Расклады ───\n"
+        f"❤️ «расклад на любовь» — 3 карты ({config.TARO_LOVE_COST} 💎)\n"
+        f"⚖️ «расклад на выбор» — 3 карты ({config.TARO_DECISION_COST} 💎)\n"
+        f"💼 «расклад на дело» — 5 карт ({config.TARO_CAREER_COST} 💎)\n"
         f"🔮 «малый расклад» — 5 карт ({config.TARO_SMALL_COST} 💎)\n"
         f"🃏 «полный расклад» — 20 карт ({config.TARO_FULL_COST} 💎)\n"
         f"⭐ «гороскоп» — персональный ({config.HOROSCOPE_COST} 💎)\n"
@@ -1612,6 +1834,46 @@ async def cmd_mood(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await db.save_message(user_id, "sofia", fallback, "mood_checkin")
 
 
+# ─────────────────── Round 5: /card_of_day ───────────────────
+
+async def cmd_card_of_day(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Карта дня — ежедневная мини-практика через одну карту Таро."""
+    if not update.message or not update.effective_user:
+        return
+    user_id = update.effective_user.id
+    user = await db.get_user(user_id)
+    if not user:
+        await update.effective_message.reply_text("Напиши /start, чтобы начать.")
+        return
+
+    if not user.get("onboarding_completed"):
+        await update.effective_message.reply_text(
+            "Сначала давай познакомимся. Напиши /start и пройди короткий путь."
+        )
+        return
+
+    await _handle_card_of_day(update, user_id, user)
+
+
+# ─────────────────── Round 5: /broadcast (admin) ───────────────────
+
+async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Запуск рассылки администратором. Переводит в состояние BROADCAST."""
+    if not update.message or not update.effective_user:
+        return
+    user_id = update.effective_user.id
+
+    if user_id != config.ADMIN_ID:
+        await update.effective_message.reply_text("Эта команда только для администратора.")
+        return
+
+    await db.update_user_state(user_id, SofiaState.BROADCAST)
+    await update.effective_message.reply_text(
+        "📢 Напиши текст рассылки — я отправлю его всем активным пользователям. "
+        "Для отмены напиши «отмена»."
+    )
+
+
 # ─────────────────── Голосовые сообщения ───────────────────
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1634,6 +1896,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                  SofiaState.ASK_BIRTH_TIME, SofiaState.ASK_BIRTH_PLACE,
                  SofiaState.PROBING, SofiaState.TARO_ASK_NUMBERS,
                  SofiaState.TARO_SMALL, SofiaState.TARO_FULL,
+                 SofiaState.TARO_LOVE, SofiaState.TARO_CAREER, SofiaState.TARO_DECISION,
                  SofiaState.AWAITING_DELETE_CONFIRM):
         await update.effective_message.reply_text(
             f"Слышу тебя, {name}. Но мне нужно, чтобы ты написал(а) это текстом — "
@@ -1748,6 +2011,8 @@ def setup_handlers(application: Application) -> None:
     application.add_handler(CommandHandler("export_my_history", cmd_export_history))
     application.add_handler(CommandHandler("mood", cmd_mood))
     application.add_handler(CommandHandler("reset", cmd_reset))
+    application.add_handler(CommandHandler("card_of_day", cmd_card_of_day))
+    application.add_handler(CommandHandler("broadcast", cmd_broadcast))
     application.add_handler(CallbackQueryHandler(handle_callback))
     # Голосовые, стикеры, фото, видео-кружки — ДО текстового обработчика
     application.add_handler(MessageHandler(filters.VOICE, handle_voice))

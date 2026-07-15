@@ -228,6 +228,63 @@ async def _cron_checkin_impl():
     logger.info(f"Cron checkin: sent {sent_count}/{len(rows)} messages")
 
 
+@app.route("/api/cron/birthday", methods=["GET", "POST"])
+def cron_birthday():
+    """Vercel Cron: отправляет поздравления с днём рождения.
+    Запускается ежедневно в 9:00. Именинников обычно мало, лимит 10."""
+    try:
+        asyncio.run(_cron_birthday_impl())
+        return jsonify({"status": "ok", "sent": True}), 200
+    except Exception as e:
+        logger.error(f"[CRON BIRTHDAY ERROR] {e}\n{traceback.format_exc()}")
+        return jsonify({"status": "error", "message": str(e)}), 200
+
+
+async def _cron_birthday_impl():
+    """Отправляет поздравления с днём рождения пользователям, у которых сегодня др."""
+    from bot.database import get_birthday_users, save_message, get_emotional_memory
+    from bot.gemini import generate_birthday_greeting
+    from bot.fsm import get_zodiac_sign
+    from datetime import date as date_cls
+
+    await _ensure_initialized()
+
+    birthday_users = await get_birthday_users(limit=10)
+    if not birthday_users:
+        logger.info("Cron birthday: no birthdays today")
+        return
+
+    sent_count = 0
+    today = date_cls.today()
+    for user in birthday_users:
+        user_id = user["user_id"]
+        name = user.get("name") or user.get("first_name") or "милый человек"
+        birth_date = user.get("birth_date")
+        birth_year = user.get("birth_year")
+
+        # Возраст
+        age = None
+        if birth_date and hasattr(birth_date, "year"):
+            age = today.year - birth_date.year
+
+        # Зодиак
+        zodiac_name, zodiac_symbol = get_zodiac_sign(birth_date) if birth_date and hasattr(birth_date, "month") else ("", "")
+        zodiac = f"{zodiac_symbol} {zodiac_name}" if zodiac_name else ""
+
+        try:
+            emotional = await get_emotional_memory(user_id, min_importance=2)
+            greeting = await generate_birthday_greeting(name, age=age, zodiac=zodiac, emotional=emotional)
+
+            await _bot_app.bot.send_message(chat_id=user_id, text=greeting)
+            await save_message(user_id, "sofia", greeting, "cron_birthday")
+            sent_count += 1
+            logger.info(f"Cron birthday sent to {user_id} (age={age})")
+        except Exception as e:
+            logger.error(f"Cron birthday error for {user_id}: {e}")
+
+    logger.info(f"Cron birthday: sent {sent_count}/{len(birthday_users)} messages")
+
+
 # Локальный тест
 if __name__ == "__main__":
     app.run(debug=True, port=3000)

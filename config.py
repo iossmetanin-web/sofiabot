@@ -59,6 +59,16 @@ class Config:
     MOOD_CHECKIN_INTERVAL_HOURS: int = 72  # через сколько часов можно отправить /mood check-in
     CRON_DAILY_BATCH: int = 5            # сколько пользователей обрабатывает cron за запуск
 
+    # ─── Round 5: новые расклады, карта дня, рассылка, дни рождения ───
+    TARO_LOVE_COST: int = 2              # расклад на любовь (3 карты)
+    TARO_CAREER_COST: int = 2            # расклад на дело (5 карт)
+    TARO_DECISION_COST: int = 2          # расклад на выбор (3 карты)
+    CARD_OF_DAY_COOLDOWN_HOURS: int = 20 # как часто доступна «карта дня»
+    CRON_CHECKIN_BATCH: int = 3          # батч cron checkin
+    CRON_BIRTHDAY_BATCH: int = 10        # батч cron birthday (именинников обычно мало)
+    BROADCAST_BATCH: int = 25            # сколько пользователей за один запрос в /broadcast
+    BROADCAST_RATE_MS: int = 35          # задержка между сообщениями в рассылке (Telegram ~30 msg/sec)
+
     @classmethod
     def validate(cls) -> list[str]:
         """Проверяет, что все обязательные переменные заданы."""
