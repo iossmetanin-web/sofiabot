@@ -1,5 +1,5 @@
 """
-Обработчики Telegram для бота София (концепция v2).
+Обработчики Telegram для бота София (концепция v2, round 4).
 
 Поток:
 START → ASK_NAME → ASK_BIRTH_DATE → ASK_BIRTH_TIME → ASK_BIRTH_PLACE
@@ -7,14 +7,15 @@ START → ASK_NAME → ASK_BIRTH_DATE → ASK_BIRTH_TIME → ASK_BIRTH_PLACE
 → CONVERSATION → (платный хук по концепции) → TARO / HOROSCOPE / SINGLE_CARD
 → CONVERSATION
 
-Особенности v2:
-- Прощупывание до Карты судьбы (1 LLM-вопрос)
-- Логика долгого отсутствия: «Я вспоминала наш прошлый разговор...»
-- Бесплатная 1-карта Таро (cooldown 24ч) — «дать вкус»
-- Inline-кнопки для платных офферов
-- Переформулированный платный хук по концепции
-- Адаптация под пол/возраст (инференс по имени/дате рождения)
-- Эмоциональная память в контексте
+Round 4:
+- Зодиак в онбординге и раскладах
+- Реальные имена карт Таро
+- /reset — сброс застрявшего FSM
+- Админ-панель с inline-кнопками
+- Cron checkin для неактивных пользователей
+- Сводка диалога при длинной истории
+- Исправлен баг: rate limit сохранял сообщение до проверки
+- Исправлен баг: бесплатная карта не сбрасывала состояние
 """
 import asyncio
 import logging
@@ -43,6 +44,8 @@ from bot.fsm import (
     is_long_absence,
     infer_gender_from_name,
     age_group_from_birth_date,
+    get_zodiac_sign,
+    get_tarot_card_name,
     MENU_TRIGGERS,
     BALANCE_TRIGGERS,
     PROFILE_TRIGGERS,
@@ -62,6 +65,7 @@ from bot.gemini import (
     generate_return_greeting,
     generate_daily_horoscope,
     generate_mood_checkin,
+    generate_conversation_summary,
     detect_topic,
 )
 
@@ -147,6 +151,15 @@ def _deeper_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
+def _admin_keyboard() -> InlineKeyboardMarkup:
+    """Админ-панель с inline-кнопками."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📊 Статистика", callback_data="admin:stats"),
+         InlineKeyboardButton("👥 Пользователи", callback_data="admin:users")],
+        [InlineKeyboardButton("📢 Рассылка", callback_data="admin:broadcast_prompt")],
+    ])
+
+
 # ─────────────────── Грубость ───────────────────
 
 RUDENESS_RESPONSES = [
@@ -156,6 +169,17 @@ RUDENESS_RESPONSES = [
     "Похоже, сегодня разговор не складывается.",
     "Я не хочу продолжать разговор, пока ты говоришь со мной таким образом.\n\nЕсли однажды захочешь поговорить спокойно, я буду здесь.",
 ]
+
+
+# ─────────────────── Хелпер: получить зодиак ───────────────────
+
+def _get_zodiac_from_user(user: dict) -> str:
+    """Получает знак зодиака из данных пользователя."""
+    birth_date = user.get("birth_date")
+    if birth_date and hasattr(birth_date, "month"):
+        name, symbol = get_zodiac_sign(birth_date)
+        return f"{symbol} {name}" if name else ""
+    return ""
 
 
 # ─────────────────── Команда /start (с реферальной ссылкой) ───────────────────
@@ -173,17 +197,14 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await db.touch_last_seen(user_id)
 
     # ─── Реферальная обработка ───
-    # /start ref_123456789 → новый пользователь пришёл по ссылке от user 123456789
     args = context.args if context.args else []
     if args and args[0].startswith("ref_"):
         try:
             ref_uid = int(args[0][4:])
-            # Только для НОВОГО пользователя (message_count == 0) и если реферер существует
             if user.get("message_count", 0) == 0 and ref_uid != user_id:
                 ref_user = await db.get_user(ref_uid)
                 if ref_user and not await db.was_referred(user_id):
                     await db.set_referred_by(user_id, ref_uid)
-                    # Награда рефереру +1 кристалл
                     await db.add_crystals(
                         ref_uid, 1,
                         f"Реферальный бонус: пригласил {user_id}",
@@ -194,18 +215,18 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         except (ValueError, TypeError):
             pass
 
-    # Если пользователь уже был — перезапускаем с тёплым приветствием (с учётом долгого отсутствия)
+    # Если пользователь уже был — перезапускаем с тёплым приветствием
     if user.get("message_count", 0) > 0:
         name = user.get("name") or first_name or "милый человек"
         last_seen = user.get("last_seen_at")
 
-        # Если давно не заходил — София «вспоминала о нём»
         if is_long_absence(last_seen, config.RETURN_ABSENCE_HOURS):
             try:
                 facts = await db.get_memory_facts(user_id, min_importance=3)
                 emotional = await db.get_emotional_memory(user_id, min_importance=3)
                 last_topic = user.get("last_topic_summary") or ""
-                greeting = await generate_return_greeting(name, facts, emotional, last_topic)
+                zodiac = _get_zodiac_from_user(user)
+                greeting = await generate_return_greeting(name, facts, emotional, last_topic, zodiac)
                 await update.effective_message.reply_text(greeting)
                 await db.save_message(user_id, "sofia", greeting, "return_greeting")
             except Exception as e:
@@ -263,14 +284,28 @@ async def cmd_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if birth_time and hasattr(birth_time, "strftime"):
         birth_time = birth_time.strftime("%H:%M")
 
+    # Зодиак
+    zodiac = _get_zodiac_from_user(user)
+    zodiac_line = f"\n♊ Знак зодиака: {zodiac}" if zodiac else ""
+
+    # Возраст
+    age_group = user.get("age_group", "")
+    age_map = {"young": "до 18", "young_adult": "18-30", "adult": "30-45",
+               "mature": "45-60", "senior": "60+"}
+    age_line = f"\n🎂 Возраст: {age_map.get(age_group, 'неизвестно')}" if age_group else ""
+
+    # Рефералы
+    ref_count = await db.get_referral_count(user_id)
+
     profile_text = (
         f"📜 Твоя карточка\n\n"
-        f"👤 Имя: {name}\n"
+        f"👤 Имя: {name}{zodiac_line}{age_line}\n"
         f"📅 Дата рождения: {birth_date}\n"
         f"🕐 Время рождения: {birth_time}\n"
         f"📍 Место рождения: {birth_place}\n"
         f"💎 Кристаллы: {crystals}\n"
         f"💬 Сообщений: {msg_count}\n"
+        f"🔗 Приглашено: {ref_count} чел.\n"
         f"📅 С нами с: {created}\n\n"
         f"─── Расклады ───\n"
         f"🔮 Малый расклад (5 карт) — {config.TARO_SMALL_COST} 💎\n"
@@ -346,22 +381,11 @@ async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
-    stats = await db.get_user_stats()
-    if not stats:
-        await update.effective_message.reply_text("Пока нет пользователей.")
-        return
-
-    lines = ["📊 Статистика бота\n"]
-    for s in stats[:20]:
-        name = s.get("name") or s.get("first_name") or s.get("username", "—")
-        lines.append(
-            f"• {name} (@{s.get('username', '—')}): "
-            f"{s.get('crystals', 0)} 💎, "
-            f"{s.get('message_count', 0)} сообщ., "
-            f"сост: {s.get('state', '—')}"
-        )
-
-    await update.effective_message.reply_text("\n".join(lines))
+    # Показываем админ-панель с inline-кнопками
+    await update.effective_message.reply_text(
+        "👑 Панель администратора Софии",
+        reply_markup=_admin_keyboard()
+    )
 
 
 # ─────────────────── Команда /stats (расширенная аналитика) ───────────────────
@@ -430,12 +454,13 @@ async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     name = user.get("name") or user.get("first_name") or "милый человек"
     birth_date = user.get("birth_date")
     date_str = birth_date.strftime("%d.%m.%Y") if hasattr(birth_date, "strftime") else str(birth_date) if birth_date else ""
+    zodiac = _get_zodiac_from_user(user)
 
     await update.effective_message.reply_text("🌅 Дай минутку, всматриваюсь в твой день...")
 
     try:
         emotional = await db.get_emotional_memory(user_id, min_importance=3)
-        daily_msg = await generate_daily_horoscope(name=name, birth_date=date_str, emotional=emotional)
+        daily_msg = await generate_daily_horoscope(name=name, birth_date=date_str, emotional=emotional, zodiac=zodiac)
         await db.mark_daily_horoscope_used(user_id)
         await db.save_message(user_id, "sofia", daily_msg, "daily_horoscope")
         await update.effective_message.reply_text(daily_msg)
@@ -471,7 +496,7 @@ async def cmd_invite(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await update.effective_message.reply_text(text)
 
 
-# ─────────────────── Команды /subscribe /unsubscribe (daily horoscope) ──────
+# ─────────────────── Команды /subscribe /unsubscribe ──────
 
 async def cmd_subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Подписка на ежедневные послания."""
@@ -547,6 +572,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "🔗 /invite — пригласить близкого (+1 💎 за каждого)\n"
         "🌅 /subscribe — утренние весточки от меня\n"
         "📥 /export_my_history — наша история диалога\n"
+        "🔄 /reset — начать разговор заново (если застрял)\n"
         "🚪 /delete_my_data — стереть все наши разговоры\n\n"
         "─── Расклады ───\n"
         f"🔮 «малый расклад» — 5 карт ({config.TARO_SMALL_COST} 💎)\n"
@@ -556,6 +582,33 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"У тебя {crystals} 💎"
     )
     await update.effective_message.reply_text(text, reply_markup=_paid_reading_keyboard(crystals))
+
+
+# ─────────────────── Команда /reset (сброс застрявшего FSM) ───────────────────
+
+async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Сброс состояния в CONVERSATION — для случаев, когда FSM застрял."""
+    if not update.message or not update.effective_user:
+        return
+    user_id = update.effective_user.id
+    user = await db.get_user(user_id)
+    if not user:
+        await update.effective_message.reply_text("Напиши /start, чтобы начать.")
+        return
+
+    old_state = user.get("state", "CONVERSATION")
+    await db.update_user_state(user_id, SofiaState.CONVERSATION)
+    await db.update_user_profile(user_id, reading_type=None)
+
+    if old_state != SofiaState.CONVERSATION:
+        await update.effective_message.reply_text(
+            "🔄 Хорошо, милый человек. Я сбросила всё, что застряло. "
+            "Давай начнём разговор заново. О чём хочешь поговорить?"
+        )
+    else:
+        await update.effective_message.reply_text(
+            "У нас всё в порядке, милый человек. Просто пиши — и мы поговорим."
+        )
 
 
 # ─────────────────── Основной обработчик текста ───────────────────
@@ -570,7 +623,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     text_stripped = text.strip()
     text_lower = text_stripped.lower()
 
-    # ─── Rate Limiting ───
+    # ─── Rate Limiting (ДО сохранения сообщения!) ───
     if not await _check_rate_limit(user_id):
         await update.effective_message.reply_text("Подожди чуток, милый человек... Я не успеваю.")
         return
@@ -584,7 +637,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     state = user.get("state", SofiaState.START)
     is_blocked = user.get("is_blocked", False)
 
-    # ─── Сохраняем сообщение пользователя ───
+    # ─── Сохраняем сообщение пользователя (только после rate limit) ───
     await db.save_message(user_id, "user", text_stripped)
 
     # ─── Проверка на «извини» (снимает блокировку) ───
@@ -723,8 +776,13 @@ async def _handle_ask_birth_date(update: Update, user_id: int, text: str, user: 
         age_group = age_group_from_birth_date(parsed_date)
         if age_group != "unknown":
             await db.update_user_profile(user_id, age_group=age_group)
+
+        # Показываем знак зодиака
+        zodiac_name, zodiac_symbol = get_zodiac_sign(parsed_date)
+        zodiac_msg = f"\n\n{zodiac_symbol} {zodiac_name}... Я запомнила." if zodiac_name else "... Запомнила."
+
         response = (
-            f"{parsed_date.strftime('%d %B %Y')}... Запомнила.\n\n"
+            f"{parsed_date.strftime('%d %B %Y')}{zodiac_msg}\n\n"
             f"А время рождения помнишь? Это поможет точнее увидеть. "
             f"Если не помнишь — скажи «пропустить»."
         )
@@ -777,7 +835,6 @@ async def _handle_ask_birth_place(update: Update, user_id: int, text: str, user:
         await update.effective_message.reply_text(response)
         await db.save_message(user_id, "sofia", response, "preparing_probing")
         await db.update_user_state(user_id, SofiaState.PROBING)
-        # Генерируем вопрос прощупывания
         await _send_probing_question(update, user_id, user)
         return
 
@@ -791,7 +848,6 @@ async def _handle_ask_birth_place(update: Update, user_id: int, text: str, user:
     await update.effective_message.reply_text(response)
     await db.save_message(user_id, "sofia", response, "preparing_probing")
     await db.update_user_state(user_id, SofiaState.PROBING)
-    # Генерируем вопрос прощупывания
     await _send_probing_question(update, user_id, user)
 
 
@@ -800,15 +856,15 @@ async def _send_probing_question(update: Update, user_id: int, user: dict) -> No
     name = user.get("name") or user.get("first_name") or "милый человек"
     birth_date = user.get("birth_date")
     date_str = birth_date.strftime("%d.%m.%Y") if hasattr(birth_date, "strftime") else str(birth_date) if birth_date else ""
+    zodiac = _get_zodiac_from_user(user)
 
     try:
-        question = await generate_probing_question(name, date_str)
+        question = await generate_probing_question(name, date_str, zodiac)
         await update.effective_message.reply_text(question)
         await db.save_message(user_id, "sofia", question, "probing_question")
         await db.increment_probing(user_id)
     except Exception as e:
         logger.error(f"Probing question error: {e}")
-        # Fallback — статический вопрос
         fallback = "Скажи... был ли в твоей жизни период, когда тебе пришлось резко повзрослеть?"
         await update.effective_message.reply_text(fallback)
         await db.save_message(user_id, "sofia", fallback, "probing_question")
@@ -819,12 +875,10 @@ async def _handle_probing(update: Update, user_id: int, text: str, user: dict) -
     """Обработка ответа на вопрос прощупывания → переход к Карте судьбы."""
     probing_count = user.get("probing_count", 0) or 0
 
-    # После 1 раунда прощупывания — открываем Карту судьбы
     if probing_count >= config.PROBING_ROUNDS:
         await _handle_free_reading(update, user_id, user, probing_answer=text)
         return
 
-    # Если ещё нужны раунды — задаём следующий вопрос (редкий кейс)
     await _send_probing_question(update, user_id, user)
 
 
@@ -839,6 +893,7 @@ async def _handle_free_reading(update: Update, user_id: int, user: dict,
     date_str = birth_date.strftime("%d.%m.%Y") if hasattr(birth_date, "strftime") else str(birth_date) if birth_date else ""
     time_str = birth_time.strftime("%H:%M") if birth_time and hasattr(birth_time, "strftime") else None
     place_str = str(birth_place) if birth_place else None
+    zodiac = _get_zodiac_from_user(user)
 
     await update.effective_message.reply_text("🗺️ Раскладываю карту... Дай мне минутку.")
 
@@ -848,6 +903,7 @@ async def _handle_free_reading(update: Update, user_id: int, user: dict,
         birth_time=time_str,
         birth_place=place_str,
         probing_answer=probing_answer,
+        zodiac=zodiac,
     )
 
     await db.save_message(user_id, "sofia", fate_card, "fate_card")
@@ -865,32 +921,27 @@ async def _handle_free_reading(update: Update, user_id: int, user: dict,
 
 
 async def _handle_return(update: Update, user_id: int, user: dict, user_message: str) -> None:
-    """Логика долгого отсутствия — София «вспоминала о тебе».
-    Отправляет приветствие и встраивает контекст пользователя в память,
-    но НЕ генерирует дополнительный ответ на само сообщение —
-    пользователь увидит приветствие и продолжит диалог сам."""
+    """Логика долгого отсутствия — София «вспоминала о тебе»."""
     name = user.get("name") or user.get("first_name") or "милый человек"
+    zodiac = _get_zodiac_from_user(user)
 
     try:
         facts = await db.get_memory_facts(user_id, min_importance=3)
         emotional = await db.get_emotional_memory(user_id, min_importance=3)
         last_topic = user.get("last_topic_summary") or ""
 
-        greeting = await generate_return_greeting(name, facts, emotional, last_topic)
+        greeting = await generate_return_greeting(name, facts, emotional, last_topic, zodiac)
         await update.effective_message.reply_text(greeting)
         await db.save_message(user_id, "sofia", greeting, "return_greeting")
 
         await db.update_user_state(user_id, SofiaState.CONVERSATION)
         await db.touch_last_seen(user_id)
 
-        # Добавляем мягкий вопрос, продолжающий контекст последнего сообщения
-        # (но не генерируем полный LLM-ответ, чтобы не перегружать)
         follow_up = "Если хочешь, расскажи — что нового с тех пор?"
         await update.effective_message.reply_text(follow_up)
         await db.save_message(user_id, "sofia", follow_up, "return_follow_up")
     except Exception as e:
         logger.error(f"Return greeting error: {e}")
-        # Fallback — простой переход в диалог
         await db.update_user_state(user_id, SofiaState.CONVERSATION)
         greeting = f"Здравствуй, {name}. Я вспоминала о тебе. Как ты?"
         await update.effective_message.reply_text(greeting)
@@ -911,6 +962,17 @@ async def _handle_conversation(update: Update, user_id: int, text: str, user: di
     date_str = birth_date.strftime("%d.%m.%Y") if hasattr(birth_date, "strftime") else (str(birth_date) if birth_date else "")
     gender = user.get("gender") or ""
     age_group = user.get("age_group") or ""
+    zodiac = _get_zodiac_from_user(user)
+
+    # Сводка диалога — если история длинная
+    conversation_summary = ""
+    if len(history) > 10:
+        try:
+            # Берём старую часть для сводки
+            older = history[:-6]
+            conversation_summary = await generate_conversation_summary(older)
+        except Exception as e:
+            logger.error(f"Summary generation error: {e}")
 
     response = await generate_response(
         user_name=name,
@@ -921,6 +983,8 @@ async def _handle_conversation(update: Update, user_id: int, text: str, user: di
         emotional=emotional,
         gender=gender,
         age_group=age_group,
+        zodiac=zodiac,
+        conversation_summary=conversation_summary,
     )
 
     await db.save_message(user_id, "sofia", response)
@@ -973,7 +1037,6 @@ async def _handle_paid_hook_response(update: Update, user_id: int, text: str, us
     text_lower = text.lower()
 
     if wants_deeper(text_lower) or any(w in text_lower for w in ["да", "хочу", "давай", "покажи"]):
-        # Показываем варианты раскладов с кнопками
         crystals = user.get("crystals", 0)
         response = (
             "Хорошо. Чтобы заглянуть глубже, мне нужны карты. Вот что я могу предложить:\n\n"
@@ -1112,11 +1175,21 @@ async def _handle_paid_reading(update: Update, user_id: int, text: str, user: di
 
 
 async def _handle_horoscope_state(update: Update, user_id: int, text: str, user: dict) -> None:
+    """Состояние HOROSCOPE — выполнить гороскоп."""
+    crystals = user.get("crystals", 0)
+    cost = config.HOROSCOPE_COST
+    if crystals < cost:
+        await update.effective_message.reply_text(
+            f"Не хватает кристаллов. У тебя {crystals} 💎, нужно {cost} 💎."
+        )
+        await db.update_user_state(user_id, SofiaState.CONVERSATION)
+        return
     await _execute_horoscope(update, user_id, user)
 
 
 async def _handle_free_card(update: Update, user_id: int, user: dict) -> None:
-    """Бесплатная 1-карта Таро — «Что сейчас важно понять?»."""
+    """Бесплатная 1-карта Таро — «Что сейчас важно понять?».
+    BUGFIX: Сбрасываем состояние в CONVERSATION после карты."""
     can = await db.can_get_free_card(user_id, config.FREE_CARD_COOLDOWN_HOURS)
     if not can:
         response = (
@@ -1126,6 +1199,8 @@ async def _handle_free_card(update: Update, user_id: int, user: dict) -> None:
         )
         await update.effective_message.reply_text(response)
         await db.save_message(user_id, "sofia", response, "free_card_cooldown")
+        # BUGFIX: Всегда возвращаем в CONVERSATION
+        await db.update_user_state(user_id, SofiaState.CONVERSATION)
         return
 
     name = user.get("name") or user.get("first_name") or "милый человек"
@@ -1141,11 +1216,13 @@ async def _handle_free_card(update: Update, user_id: int, user: dict) -> None:
     await db.mark_free_card_used(user_id)
     await db.save_message(user_id, "sofia", card_text, "free_card")
     await _send_long_message(update, card_text)
+    # BUGFIX: Сбрасываем состояние в CONVERSATION после бесплатной карты
+    await db.update_user_state(user_id, SofiaState.CONVERSATION)
 
 
 async def _execute_taro_reading(update: Update, user_id: int, user: dict,
                                  numbers: list[int], full: bool, cost: int) -> None:
-    """Исполняет расклад Таро."""
+    """Исполняет расклад Таро с реальными именами карт."""
     type_name = "Полный расклад" if full else "Малый расклад"
 
     success = await db.spend_crystals(user_id, cost, type_name)
@@ -1166,6 +1243,9 @@ async def _execute_taro_reading(update: Update, user_id: int, user: dict,
 
     name = user.get("name") or user.get("first_name") or "милый человек"
 
+    # Маппинг чисел → имена карт
+    card_names = {n: get_tarot_card_name(n) for n in numbers}
+
     await update.effective_message.reply_text("🗺️ Раскладываю карты... Дай мне минутку.")
 
     reading = await generate_taro_reading(
@@ -1173,6 +1253,7 @@ async def _execute_taro_reading(update: Update, user_id: int, user: dict,
         question=topic,
         numbers=numbers,
         full=full,
+        card_names=card_names,
     )
 
     type_label = "🃏 Полный расклад судьбы" if full else "🔮 Малый расклад"
@@ -1206,6 +1287,7 @@ async def _execute_horoscope(update: Update, user_id: int, user: dict) -> None:
     name = user.get("name") or user.get("first_name") or "милый человек"
     birth_date = user.get("birth_date")
     date_str = birth_date.strftime("%d.%m.%Y") if hasattr(birth_date, "strftime") else (str(birth_date) if birth_date else "")
+    zodiac = _get_zodiac_from_user(user)
 
     concerns = ""
     recent = await db.get_recent_messages(user_id, limit=4)
@@ -1218,6 +1300,7 @@ async def _execute_horoscope(update: Update, user_id: int, user: dict) -> None:
         birth_time=str(user.get("birth_time")) if user.get("birth_time") else None,
         birth_place=user.get("birth_place"),
         concerns=concerns,
+        zodiac=zodiac,
     )
 
     await db.save_message(user_id, "sofia", horoscope, "horoscope")
@@ -1246,7 +1329,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     elif data == "reading:full":
         await _start_reading_flow(update, user_id, user, SofiaState.TARO_FULL, "full", 20, config.TARO_FULL_COST, "Полный расклад")
     elif data == "reading:horoscope":
-        # Для гороскопа числа не нужны
         await _execute_horoscope(update, user_id, user)
     elif data == "reading:free_card":
         await _handle_free_card(update, user_id, user)
@@ -1263,6 +1345,29 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await _safe_reply(update, response)
         await db.save_message(user_id, "sofia", response, "hook_declined")
         await db.update_user_state(user_id, SofiaState.CONVERSATION)
+    elif data == "admin:stats":
+        if user_id == config.ADMIN_ID:
+            await cmd_stats(update, context)
+    elif data == "admin:users":
+        if user_id == config.ADMIN_ID:
+            stats = await db.get_user_stats()
+            if not stats:
+                await _safe_reply(update, "Пока нет пользователей.")
+                return
+            lines = ["👥 Пользователи:\n"]
+            for s in stats[:20]:
+                name = s.get("name") or s.get("first_name") or s.get("username", "—")
+                lines.append(
+                    f"• {name} (@{s.get('username', '—')}): "
+                    f"{s.get('crystals', 0)} 💎, "
+                    f"{s.get('message_count', 0)} сообщ., "
+                    f"сост: {s.get('state', '—')}"
+                )
+            await _safe_reply(update, "\n".join(lines))
+    elif data == "admin:broadcast_prompt":
+        if user_id == config.ADMIN_ID:
+            await _safe_reply(update, "📢 Напиши текст рассылки, и я отправлю его всем пользователям. Для отмены напиши «отмена».")
+            await db.update_user_state(user_id, SofiaState.CONVERSATION)  # TODO: add BROADCAST state
 
 
 async def _start_reading_flow(update: Update, user_id: int, user: dict,
@@ -1313,9 +1418,11 @@ async def _show_history(update: Update, user_id: int) -> None:
 async def _show_menu(update: Update, user: dict) -> None:
     name = user.get("name") or user.get("first_name") or "милый человек"
     crystals = user.get("crystals", 0)
+    zodiac = _get_zodiac_from_user(user)
+    zodiac_line = f"\n♊ {zodiac}" if zodiac else ""
 
     menu = (
-        f"📋 Вот что можно сделать, {name}:\n\n"
+        f"📋 Вот что можно сделать, {name}:{zodiac_line}\n\n"
         f"💬 Просто пиши — и мы поговорим\n"
         f"🌅 /today — послание дня (бесплатно)\n"
         f"💚 /mood — я спрошу, как ты\n"
@@ -1324,7 +1431,8 @@ async def _show_menu(update: Update, user: dict) -> None:
         f"📜 «история» — последние сообщения\n"
         f"📥 /export_my_history — наша история\n"
         f"🔗 /invite — пригласить близкого (+1 💎)\n"
-        f"🌅 /subscribe — утренние весточки\n\n"
+        f"🌅 /subscribe — утренние весточки\n"
+        f"🔄 /reset — начать заново\n\n"
         f"─── Расклады ───\n"
         f"🔮 «малый расклад» — 5 карт ({config.TARO_SMALL_COST} 💎)\n"
         f"🃏 «полный расклад» — 20 карт ({config.TARO_FULL_COST} 💎)\n"
@@ -1332,7 +1440,6 @@ async def _show_menu(update: Update, user: dict) -> None:
         f"🗺️ «бесплатная карта» — 1 карта (0 💎, раз в {config.FREE_CARD_COOLDOWN_HOURS}ч)\n\n"
         f"У тебя {crystals} 💎"
     )
-    # Кнопки для быстрого доступа
     await update.effective_message.reply_text(menu, reply_markup=_paid_reading_keyboard(crystals))
 
 
@@ -1462,7 +1569,6 @@ async def cmd_export_history(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
         text = "\n".join(lines)
 
-        # Если текст слишком длинный — обрезаем
         if len(text) > 4000:
             text = text[:3950] + "\n\n... (показаны последние 100 сообщений)"
 
@@ -1491,16 +1597,16 @@ async def cmd_mood(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     name = user.get("name") or user.get("first_name") or "милый человек"
+    zodiac = _get_zodiac_from_user(user)
 
     try:
         emotional = await db.get_emotional_memory(user_id, min_importance=2)
         last_topic = user.get("last_topic_summary") or ""
-        checkin = await generate_mood_checkin(name, emotional, last_topic)
+        checkin = await generate_mood_checkin(name, emotional, last_topic, zodiac)
         await update.effective_message.reply_text(checkin)
         await db.save_message(user_id, "sofia", checkin, "mood_checkin")
     except Exception as e:
         logger.error(f"cmd_mood error: {e}", exc_info=True)
-        # Fallback — статический текст
         fallback = f"{name}, как ты сегодня? Я тут подумала о тебе..."
         await update.effective_message.reply_text(fallback)
         await db.save_message(user_id, "sofia", fallback, "mood_checkin")
@@ -1519,13 +1625,11 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         update.effective_user.first_name,
     )
 
-    # Обновляем last_seen
     await db.touch_last_seen(user_id)
 
     name = user.get("name") or user.get("first_name") or "милый человек"
     state = user.get("state", SofiaState.START)
 
-    # Если в процессе онбординга — просим написать текст
     if state in (SofiaState.ASK_NAME, SofiaState.ASK_BIRTH_DATE,
                  SofiaState.ASK_BIRTH_TIME, SofiaState.ASK_BIRTH_PLACE,
                  SofiaState.PROBING, SofiaState.TARO_ASK_NUMBERS,
@@ -1537,7 +1641,6 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         )
         return
 
-    # В диалоге — тепло реагируем
     response = (
         f"Слышу твой голос, {name}. Жаль, что не могу разобрать слова — "
         f"мои уши ещё не настолько чуткие. Напиши мне текстом, о чём хочешь рассказать?"
@@ -1562,7 +1665,6 @@ async def handle_sticker(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await db.touch_last_seen(user_id)
 
     name = user.get("name") or user.get("first_name") or "милый человек"
-    # Разные реакции для разнообразия
     import random
     reactions = [
         f"Красивый стикер, {name}. Но мне было бы легче понять тебя, если бы ты написал(а) словами.",
@@ -1588,12 +1690,9 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await db.touch_last_seen(user_id)
 
     name = user.get("name") or user.get("first_name") or "милый человек"
-    # Если есть подпись к фото — обрабатываем как текст
     caption = update.message.caption
     if caption and len(caption.strip()) > 2:
-        # Сохраняем и обрабатываем подпись как обычное сообщение
         await db.save_message(user_id, "user", f"[фото] {caption.strip()}")
-        # Создаём фейковый update для обработки текстом
         update.message.text = caption.strip()
         await handle_message(update, context)
         return
@@ -1605,6 +1704,30 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.effective_message.reply_text(response)
     await db.save_message(user_id, "user", "[фото]")
     await db.save_message(user_id, "sofia", response, "photo_fallback")
+
+
+# ─────────────────── Видео-кружки ───────────────────
+
+async def handle_video_note(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Реакция на видео-кружок — София просит текст."""
+    if not update.message or not update.effective_user:
+        return
+    user_id = update.effective_user.id
+    user = await db.get_or_create_user(
+        user_id,
+        update.effective_user.username,
+        update.effective_user.first_name,
+    )
+    await db.touch_last_seen(user_id)
+
+    name = user.get("name") or user.get("first_name") or "милый человек"
+    response = (
+        f"Вижу твоё видео, {name}. Жаль, мои глаза пока не видят движущихся картинок. "
+        f"Расскажи мне текстом, что хотела(а) показать — и мы поговорим."
+    )
+    await update.effective_message.reply_text(response)
+    await db.save_message(user_id, "user", "[видео-кружок]")
+    await db.save_message(user_id, "sofia", response, "video_note_fallback")
 
 
 # ─────────────────── Настройка обработчиков ───────────────────
@@ -1624,11 +1747,13 @@ def setup_handlers(application: Application) -> None:
     application.add_handler(CommandHandler("delete_my_data", cmd_delete_my_data))
     application.add_handler(CommandHandler("export_my_history", cmd_export_history))
     application.add_handler(CommandHandler("mood", cmd_mood))
+    application.add_handler(CommandHandler("reset", cmd_reset))
     application.add_handler(CallbackQueryHandler(handle_callback))
-    # Голосовые, стикеры, фото — ДО текстового обработчика
+    # Голосовые, стикеры, фото, видео-кружки — ДО текстового обработчика
     application.add_handler(MessageHandler(filters.VOICE, handle_voice))
     application.add_handler(MessageHandler(filters.Sticker.ALL, handle_sticker))
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    application.add_handler(MessageHandler(filters.VIDEO_NOTE, handle_video_note))
     # Текстовый обработчик — последний
     application.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
