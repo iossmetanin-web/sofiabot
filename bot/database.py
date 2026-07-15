@@ -640,16 +640,15 @@ async def was_referred(user_id: int) -> bool:
 # ─── Daily horoscope ───
 
 async def can_get_daily_horoscope(user_id: int) -> bool:
-    """True, если сегодня пользователь ещё не получал daily horoscope."""
+    """True, если сегодня пользователь ещё не получал daily horoscope.
+    Используем CURRENT_DATE из PostgreSQL для консистентности с mark_daily_horoscope_used."""
     conn = await get_conn()
     try:
-        last = await conn.fetchval(
-            "SELECT last_daily_horoscope_date FROM users WHERE user_id = $1", user_id
+        result = await conn.fetchval(
+            "SELECT (last_daily_horoscope_date IS NULL OR last_daily_horoscope_date < CURRENT_DATE) FROM users WHERE user_id = $1",
+            user_id,
         )
-        if last is None:
-            return True
-        today = datetime.now(timezone.utc).date()
-        return last < today
+        return bool(result)
     finally:
         await conn.close()
 
@@ -698,41 +697,30 @@ async def get_daily_horoscope_subscribers() -> list[dict]:
 # ─── Admin analytics (расширенная) ───
 
 async def get_admin_analytics() -> dict:
-    """Сводная статистика для /stats."""
+    """Сводная статистика для /stats. Оптимизировано — один запрос вместо 12."""
     conn = await get_conn()
     try:
-        total_users = await conn.fetchval("SELECT COUNT(*) FROM users") or 0
-        active_24h = await conn.fetchval(
-            "SELECT COUNT(*) FROM users WHERE last_seen_at > NOW() - INTERVAL '24 hours'"
-        ) or 0
-        active_7d = await conn.fetchval(
-            "SELECT COUNT(*) FROM users WHERE last_seen_at > NOW() - INTERVAL '7 days'"
-        ) or 0
-        onboarding_done = await conn.fetchval(
-            "SELECT COUNT(*) FROM users WHERE onboarding_completed = TRUE"
-        ) or 0
-        total_crystals = await conn.fetchval("SELECT COALESCE(SUM(crystals), 0) FROM users") or 0
-        total_messages = await conn.fetchval("SELECT COUNT(*) FROM conversations") or 0
-        total_transactions = await conn.fetchval(
-            "SELECT COUNT(*) FROM transactions WHERE type = 'spend'"
-        ) or 0
-        blocked_users = await conn.fetchval(
-            "SELECT COUNT(*) FROM users WHERE is_blocked = TRUE"
-        ) or 0
-        referral_count = await conn.fetchval(
-            "SELECT COUNT(*) FROM users WHERE referred_by IS NOT NULL"
-        ) or 0
-        daily_subscribers = await conn.fetchval(
-            "SELECT COUNT(*) FROM users WHERE daily_horoscope_opt_in = TRUE"
-        ) or 0
+        # Единый запрос с несколькими агрегатами — вместо 12 отдельных коннектов
+        row = await conn.fetchrow("""
+            SELECT
+                (SELECT COUNT(*) FROM users) AS total_users,
+                (SELECT COUNT(*) FROM users WHERE last_seen_at > NOW() - INTERVAL '24 hours') AS active_24h,
+                (SELECT COUNT(*) FROM users WHERE last_seen_at > NOW() - INTERVAL '7 days') AS active_7d,
+                (SELECT COUNT(*) FROM users WHERE onboarding_completed = TRUE) AS onboarding_done,
+                (SELECT COALESCE(SUM(crystals), 0) FROM users) AS total_crystals,
+                (SELECT COUNT(*) FROM conversations) AS total_messages,
+                (SELECT COUNT(*) FROM transactions WHERE type = 'spend') AS paid_transactions,
+                (SELECT COUNT(DISTINCT user_id) FROM transactions WHERE type = 'spend') AS paying_users,
+                (SELECT COUNT(*) FROM users WHERE is_blocked = TRUE) AS blocked_users,
+                (SELECT COUNT(*) FROM users WHERE referred_by IS NOT NULL) AS referral_users,
+                (SELECT COUNT(*) FROM users WHERE daily_horoscope_opt_in = TRUE) AS daily_subscribers
+        """)
 
-        # Конверсия: % пользователей, совершивших хотя бы одну покупку
-        paying_users = await conn.fetchval(
-            """SELECT COUNT(DISTINCT user_id) FROM transactions WHERE type = 'spend'"""
-        ) or 0
+        total_users = row["total_users"] or 0
+        paying_users = row["paying_users"] or 0
         conversion = round((paying_users / total_users * 100), 1) if total_users else 0.0
 
-        # Топ-5 активных по сообщениям
+        # Топ-5 активных (второй запрос)
         top_active = await conn.fetch("""
             SELECT name, first_name, username, message_count, crystals
             FROM users WHERE is_blocked = FALSE
@@ -742,17 +730,17 @@ async def get_admin_analytics() -> dict:
 
         return {
             "total_users": total_users,
-            "active_24h": active_24h,
-            "active_7d": active_7d,
-            "onboarding_done": onboarding_done,
-            "total_crystals": total_crystals,
-            "total_messages": total_messages,
-            "paid_transactions": total_transactions,
+            "active_24h": row["active_24h"] or 0,
+            "active_7d": row["active_7d"] or 0,
+            "onboarding_done": row["onboarding_done"] or 0,
+            "total_crystals": row["total_crystals"] or 0,
+            "total_messages": row["total_messages"] or 0,
+            "paid_transactions": row["paid_transactions"] or 0,
             "paying_users": paying_users,
             "conversion_pct": conversion,
-            "blocked_users": blocked_users,
-            "referral_users": referral_count,
-            "daily_subscribers": daily_subscribers,
+            "blocked_users": row["blocked_users"] or 0,
+            "referral_users": row["referral_users"] or 0,
+            "daily_subscribers": row["daily_subscribers"] or 0,
             "top_active": top_active,
         }
     finally:

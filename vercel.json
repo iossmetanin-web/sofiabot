@@ -18,6 +18,16 @@
     {
       "src": "/api/health",
       "dest": "api/webhook.py"
+    },
+    {
+      "src": "/api/cron/daily",
+      "dest": "api/webhook.py"
+    }
+  ],
+  "crons": [
+    {
+      "path": "/api/cron/daily",
+      "schedule": "0 6 * * *"
     }
   ]
 }

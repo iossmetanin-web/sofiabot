@@ -61,6 +61,7 @@ from bot.gemini import (
     generate_probing_question,
     generate_return_greeting,
     generate_daily_horoscope,
+    generate_mood_checkin,
     detect_topic,
 )
 
@@ -193,16 +194,35 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         except (ValueError, TypeError):
             pass
 
-    # Если пользователь уже был — перезапускаем с тёплым приветствием
+    # Если пользователь уже был — перезапускаем с тёплым приветствием (с учётом долгого отсутствия)
     if user.get("message_count", 0) > 0:
         name = user.get("name") or first_name or "милый человек"
-        greeting = (
-            f"Здравствуй снова, {name}. "
-            f"Соскучилась по тебе. Что привело тебя ко мне сегодня?"
-        )
-        await update.effective_message.reply_text(greeting)
+        last_seen = user.get("last_seen_at")
+
+        # Если давно не заходил — София «вспоминала о нём»
+        if is_long_absence(last_seen, config.RETURN_ABSENCE_HOURS):
+            try:
+                facts = await db.get_memory_facts(user_id, min_importance=3)
+                emotional = await db.get_emotional_memory(user_id, min_importance=3)
+                last_topic = user.get("last_topic_summary") or ""
+                greeting = await generate_return_greeting(name, facts, emotional, last_topic)
+                await update.effective_message.reply_text(greeting)
+                await db.save_message(user_id, "sofia", greeting, "return_greeting")
+            except Exception as e:
+                logger.error(f"Return greeting on /start error: {e}")
+                greeting = f"Здравствуй снова, {name}. Соскучилась по тебе. Что привело тебя ко мне сегодня?"
+                await update.effective_message.reply_text(greeting)
+                await db.save_message(user_id, "sofia", greeting, "greeting")
+        else:
+            greeting = (
+                f"Здравствуй снова, {name}. "
+                f"Соскучилась по тебе. Что привело тебя ко мне сегодня?"
+            )
+            await update.effective_message.reply_text(greeting)
+            await db.save_message(user_id, "sofia", greeting, "greeting")
+
         await db.update_user_state(user_id, SofiaState.CONVERSATION)
-        await db.save_message(user_id, "sofia", greeting, "greeting")
+        await db.touch_last_seen(user_id)
         return
 
     # Первый вход — концепция v2: разрушение ожидания бота
@@ -520,11 +540,13 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "🌙 Я — София. Вот что я умею:\n\n"
         "💬 Просто пиши — и мы поговорим\n"
         "🌅 /today — послание дня (бесплатно, раз в день)\n"
+        "💚 /mood — я спрошу, как ты (с заботой)\n"
         "📜 /profile — твоя карточка\n"
         "💎 /balance — сколько кристаллов\n"
         "📖 «история» — последние сообщения\n"
         "🔗 /invite — пригласить близкого (+1 💎 за каждого)\n"
         "🌅 /subscribe — утренние весточки от меня\n"
+        "📥 /export_my_history — наша история диалога\n"
         "🚪 /delete_my_data — стереть все наши разговоры\n\n"
         "─── Расклады ───\n"
         f"🔮 «малый расклад» — 5 карт ({config.TARO_SMALL_COST} 💎)\n"
@@ -843,7 +865,10 @@ async def _handle_free_reading(update: Update, user_id: int, user: dict,
 
 
 async def _handle_return(update: Update, user_id: int, user: dict, user_message: str) -> None:
-    """Логика долгого отсутствия — София «вспоминала о тебе»."""
+    """Логика долгого отсутствия — София «вспоминала о тебе».
+    Отправляет приветствие и встраивает контекст пользователя в память,
+    но НЕ генерирует дополнительный ответ на само сообщение —
+    пользователь увидит приветствие и продолжит диалог сам."""
     name = user.get("name") or user.get("first_name") or "милый человек"
 
     try:
@@ -855,17 +880,21 @@ async def _handle_return(update: Update, user_id: int, user: dict, user_message:
         await update.effective_message.reply_text(greeting)
         await db.save_message(user_id, "sofia", greeting, "return_greeting")
 
-        # Сохраняем сообщение пользователя уже после greeting
         await db.update_user_state(user_id, SofiaState.CONVERSATION)
         await db.touch_last_seen(user_id)
 
-        # Теперь отвечаем на само сообщение пользователя
-        await _handle_conversation(update, user_id, user_message, user)
+        # Добавляем мягкий вопрос, продолжающий контекст последнего сообщения
+        # (но не генерируем полный LLM-ответ, чтобы не перегружать)
+        follow_up = "Если хочешь, расскажи — что нового с тех пор?"
+        await update.effective_message.reply_text(follow_up)
+        await db.save_message(user_id, "sofia", follow_up, "return_follow_up")
     except Exception as e:
         logger.error(f"Return greeting error: {e}")
         # Fallback — простой переход в диалог
         await db.update_user_state(user_id, SofiaState.CONVERSATION)
-        await _handle_conversation(update, user_id, user_message, user)
+        greeting = f"Здравствуй, {name}. Я вспоминала о тебе. Как ты?"
+        await update.effective_message.reply_text(greeting)
+        await db.save_message(user_id, "sofia", greeting, "return_greeting")
 
 
 async def _handle_conversation(update: Update, user_id: int, text: str, user: dict) -> None:
@@ -1289,9 +1318,11 @@ async def _show_menu(update: Update, user: dict) -> None:
         f"📋 Вот что можно сделать, {name}:\n\n"
         f"💬 Просто пиши — и мы поговорим\n"
         f"🌅 /today — послание дня (бесплатно)\n"
+        f"💚 /mood — я спрошу, как ты\n"
         f"📊 «профиль» — твоя карточка\n"
         f"💎 «баланс» — сколько кристаллов\n"
         f"📜 «история» — последние сообщения\n"
+        f"📥 /export_my_history — наша история\n"
         f"🔗 /invite — пригласить близкого (+1 💎)\n"
         f"🌅 /subscribe — утренние весточки\n\n"
         f"─── Расклады ───\n"
@@ -1314,7 +1345,8 @@ def _parse_date(text: str):
     for fmt in formats:
         try:
             parsed = datetime.strptime(text, fmt).date()
-            if 1900 <= parsed.year <= 2015:
+            current_year = datetime.now().year
+            if 1900 <= parsed.year <= current_year:
                 return parsed
         except ValueError:
             continue
@@ -1325,7 +1357,8 @@ def _parse_date(text: str):
             day, month, year = int(match.group(1)), int(match.group(2)), int(match.group(3))
             if year < 100:
                 year += 1900 if year >= 40 else 2000
-            if 1900 <= year <= 2015 and 1 <= month <= 12 and 1 <= day <= 31:
+            current_year = datetime.now().year
+            if 1900 <= year <= current_year and 1 <= month <= 12 and 1 <= day <= 31:
                 return date_type(year, month, day)
         except (ValueError, TypeError):
             pass
@@ -1396,6 +1429,184 @@ async def _handle_delete_confirm(update: Update, user_id: int, text: str) -> Non
         )
 
 
+# ─────────────────── Команда /export_my_history ───────────────────
+
+async def cmd_export_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Экспорт истории диалога пользователя."""
+    if not update.message or not update.effective_user:
+        return
+    user_id = update.effective_user.id
+    user = await db.get_user(user_id)
+    if not user:
+        await update.effective_message.reply_text("Напиши /start, чтобы начать.")
+        return
+
+    if not user.get("onboarding_completed"):
+        await update.effective_message.reply_text(
+            "У нас пока нет истории. Сначала давай познакомимся — напиши /start."
+        )
+        return
+
+    try:
+        messages = await db.get_recent_messages(user_id, limit=100)
+        if not messages:
+            await update.effective_message.reply_text("У нас пока нет истории диалога.")
+            return
+
+        name = user.get("name") or user.get("first_name") or "Пользователь"
+        lines = [f"📜 История разговоров с Софией — {name}\n{'='*40}\n"]
+        for msg in messages:
+            who = "👵 София" if msg["role"] == "sofia" else "👤 Ты"
+            content = msg["content"][:300]
+            lines.append(f"{who}: {content}\n")
+
+        text = "\n".join(lines)
+
+        # Если текст слишком длинный — обрезаем
+        if len(text) > 4000:
+            text = text[:3950] + "\n\n... (показаны последние 100 сообщений)"
+
+        await update.effective_message.reply_text(text)
+    except Exception as e:
+        logger.error(f"cmd_export_history error: {e}", exc_info=True)
+        await update.effective_message.reply_text("Не удалось загрузить историю. Попробуй позже.")
+
+
+# ─────────────────── Команда /mood (проверка настроения) ───────────────────
+
+async def cmd_mood(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """София спрашивает о настроении — заботливая проверка."""
+    if not update.message or not update.effective_user:
+        return
+    user_id = update.effective_user.id
+    user = await db.get_user(user_id)
+    if not user:
+        await update.effective_message.reply_text("Напиши /start, чтобы начать.")
+        return
+
+    if not user.get("onboarding_completed"):
+        await update.effective_message.reply_text(
+            "Сначала давай познакомимся. Напиши /start и пройди короткий путь."
+        )
+        return
+
+    name = user.get("name") or user.get("first_name") or "милый человек"
+
+    try:
+        emotional = await db.get_emotional_memory(user_id, min_importance=2)
+        last_topic = user.get("last_topic_summary") or ""
+        checkin = await generate_mood_checkin(name, emotional, last_topic)
+        await update.effective_message.reply_text(checkin)
+        await db.save_message(user_id, "sofia", checkin, "mood_checkin")
+    except Exception as e:
+        logger.error(f"cmd_mood error: {e}", exc_info=True)
+        # Fallback — статический текст
+        fallback = f"{name}, как ты сегодня? Я тут подумала о тебе..."
+        await update.effective_message.reply_text(fallback)
+        await db.save_message(user_id, "sofia", fallback, "mood_checkin")
+
+
+# ─────────────────── Голосовые сообщения ───────────────────
+
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработка голосовых сообщений — София реагирует тепло, но просит текст."""
+    if not update.message or not update.effective_user:
+        return
+    user_id = update.effective_user.id
+    user = await db.get_or_create_user(
+        user_id,
+        update.effective_user.username,
+        update.effective_user.first_name,
+    )
+
+    # Обновляем last_seen
+    await db.touch_last_seen(user_id)
+
+    name = user.get("name") or user.get("first_name") or "милый человек"
+    state = user.get("state", SofiaState.START)
+
+    # Если в процессе онбординга — просим написать текст
+    if state in (SofiaState.ASK_NAME, SofiaState.ASK_BIRTH_DATE,
+                 SofiaState.ASK_BIRTH_TIME, SofiaState.ASK_BIRTH_PLACE,
+                 SofiaState.PROBING, SofiaState.TARO_ASK_NUMBERS,
+                 SofiaState.TARO_SMALL, SofiaState.TARO_FULL,
+                 SofiaState.AWAITING_DELETE_CONFIRM):
+        await update.effective_message.reply_text(
+            f"Слышу тебя, {name}. Но мне нужно, чтобы ты написал(а) это текстом — "
+            f"я пока не умею слушать голос. Напиши, пожалуйста."
+        )
+        return
+
+    # В диалоге — тепло реагируем
+    response = (
+        f"Слышу твой голос, {name}. Жаль, что не могу разобрать слова — "
+        f"мои уши ещё не настолько чуткие. Напиши мне текстом, о чём хочешь рассказать?"
+    )
+    await update.effective_message.reply_text(response)
+    await db.save_message(user_id, "user", "[голосовое сообщение]")
+    await db.save_message(user_id, "sofia", response, "voice_fallback")
+
+
+# ─────────────────── Стикеры и фото ───────────────────
+
+async def handle_sticker(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Реакция на стикер — тёплая, но с просьбой текста."""
+    if not update.message or not update.effective_user:
+        return
+    user_id = update.effective_user.id
+    user = await db.get_or_create_user(
+        user_id,
+        update.effective_user.username,
+        update.effective_user.first_name,
+    )
+    await db.touch_last_seen(user_id)
+
+    name = user.get("name") or user.get("first_name") or "милый человек"
+    # Разные реакции для разнообразия
+    import random
+    reactions = [
+        f"Красивый стикер, {name}. Но мне было бы легче понять тебя, если бы ты написал(а) словами.",
+        f"Я вижу, ты хочешь что-то сказать, {name}. Напиши мне — я прочитаю.",
+        f"Иногда один стикер стоит тысячи слов. Но я бы всё же предпочла услышать твои слова, {name}.",
+    ]
+    response = random.choice(reactions)
+    await update.effective_message.reply_text(response)
+    await db.save_message(user_id, "user", "[стикер]")
+    await db.save_message(user_id, "sofia", response, "sticker_fallback")
+
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Реакция на фото."""
+    if not update.message or not update.effective_user:
+        return
+    user_id = update.effective_user.id
+    user = await db.get_or_create_user(
+        user_id,
+        update.effective_user.username,
+        update.effective_user.first_name,
+    )
+    await db.touch_last_seen(user_id)
+
+    name = user.get("name") or user.get("first_name") or "милый человек"
+    # Если есть подпись к фото — обрабатываем как текст
+    caption = update.message.caption
+    if caption and len(caption.strip()) > 2:
+        # Сохраняем и обрабатываем подпись как обычное сообщение
+        await db.save_message(user_id, "user", f"[фото] {caption.strip()}")
+        # Создаём фейковый update для обработки текстом
+        update.message.text = caption.strip()
+        await handle_message(update, context)
+        return
+
+    response = (
+        f"Вижу, ты прислал(а) мне картинку, {name}. Жаль, мои глаза пока "
+        f"не видят изображения. Расскажи мне текстом, что на ней — и мы поговорим."
+    )
+    await update.effective_message.reply_text(response)
+    await db.save_message(user_id, "user", "[фото]")
+    await db.save_message(user_id, "sofia", response, "photo_fallback")
+
+
 # ─────────────────── Настройка обработчиков ───────────────────
 
 def setup_handlers(application: Application) -> None:
@@ -1411,7 +1622,14 @@ def setup_handlers(application: Application) -> None:
     application.add_handler(CommandHandler("subscribe", cmd_subscribe))
     application.add_handler(CommandHandler("unsubscribe", cmd_unsubscribe))
     application.add_handler(CommandHandler("delete_my_data", cmd_delete_my_data))
+    application.add_handler(CommandHandler("export_my_history", cmd_export_history))
+    application.add_handler(CommandHandler("mood", cmd_mood))
     application.add_handler(CallbackQueryHandler(handle_callback))
+    # Голосовые, стикеры, фото — ДО текстового обработчика
+    application.add_handler(MessageHandler(filters.VOICE, handle_voice))
+    application.add_handler(MessageHandler(filters.Sticker.ALL, handle_sticker))
+    application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    # Текстовый обработчик — последний
     application.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
     )

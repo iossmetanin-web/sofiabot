@@ -113,6 +113,66 @@ def health():
     }), 200
 
 
+@app.route("/api/cron/daily", methods=["GET", "POST"])
+def cron_daily():
+    """Vercel Cron: отправляет ежедневные послания подписчикам.
+    Ограничение: Vercel Serverless 10 сек. Поэтому обрабатываем батчами по 5 пользователей."""
+    try:
+        asyncio.run(_cron_daily_impl())
+        return jsonify({"status": "ok", "sent": True}), 200
+    except Exception as e:
+        logger.error(f"[CRON DAILY ERROR] {e}\n{traceback.format_exc()}")
+        return jsonify({"status": "error", "message": str(e)}), 200
+
+
+async def _cron_daily_impl():
+    """Отправляет ежедневные послания подписчикам (батч по 5)."""
+    from bot.database import get_daily_horoscope_subscribers, save_message, mark_daily_horoscope_used
+    from bot.gemini import generate_daily_horoscope
+
+    # Инициализируем бота если нужно
+    global _bot_app, _db_initialized
+    if _bot_app is None:
+        from bot.handlers import setup_handlers
+        _bot_app = Application.builder().token(TOKEN).build()
+        setup_handlers(_bot_app)
+        await _bot_app.initialize()
+
+    if not _db_initialized:
+        from bot.database import init_db
+        try:
+            await init_db()
+            _db_initialized = True
+        except Exception as e:
+            logger.error(f"Cron: DB init error: {e}")
+            return
+
+    subscribers = await get_daily_horoscope_subscribers()
+    sent_count = 0
+
+    for user in subscribers[:5]:  # Лимит 5 за один запуск (serverless timeout)
+        user_id = user["user_id"]
+        name = user.get("name") or user.get("first_name") or "милый человек"
+        birth_date = user.get("birth_date")
+        date_str = birth_date.strftime("%d.%m.%Y") if hasattr(birth_date, "strftime") else (str(birth_date) if birth_date else "")
+
+        try:
+            from bot.database import get_emotional_memory
+            emotional = await get_emotional_memory(user_id, min_importance=2)
+            daily_msg = await generate_daily_horoscope(name=name, birth_date=date_str, emotional=emotional)
+
+            # Отправляем сообщение через Telegram Bot API
+            await _bot_app.bot.send_message(chat_id=user_id, text=daily_msg)
+            await save_message(user_id, "sofia", daily_msg, "daily_horoscope_cron")
+            await mark_daily_horoscope_used(user_id)
+            sent_count += 1
+            logger.info(f"Cron daily sent to {user_id}")
+        except Exception as e:
+            logger.error(f"Cron daily error for {user_id}: {e}")
+
+    logger.info(f"Cron daily: sent {sent_count}/{len(subscribers[:5])} messages")
+
+
 # Локальный тест
 if __name__ == "__main__":
     app.run(debug=True, port=3000)

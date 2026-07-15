@@ -56,6 +56,8 @@ class Config:
     PAID_HOOK_MIN_MESSAGES: int = 6      # с какого номера сообщения возможен платный хук
     PAID_HOOK_EVERY: int = 7             # как часто повторять платный хук (каждые N сообщений после минимума)
     MAX_TARO_NUMBER: int = 78
+    MOOD_CHECKIN_INTERVAL_HOURS: int = 72  # через сколько часов можно отправить /mood check-in
+    CRON_DAILY_BATCH: int = 5            # сколько пользователей обрабатывает cron за запуск
 
     @classmethod
     def validate(cls) -> list[str]:
