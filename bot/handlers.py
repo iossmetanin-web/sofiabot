@@ -88,6 +88,52 @@ async def _check_rate_limit(user_id: int) -> bool:
 # ─────────────────── Хелперы отправки ───────────────────
 
 
+async def _typing_loop(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Фоновый цикл: каждые 4 секунды обновляет индикатор «печатает...».
+
+    Telegram сбрасывает chat_action через ~5 секунд, поэтому нужно
+    постоянно его обновлять во время долгих LLM-вызовов.
+    Останавливается через asyncio.CancelledError.
+    """
+    try:
+        while True:
+            await asyncio.sleep(4)
+            try:
+                await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+            except Exception:
+                pass
+    except asyncio.CancelledError:
+        return
+
+
+async def _with_typing(update: Update, context: ContextTypes.DEFAULT_TYPE, coro):
+    """Запускает coro, показывая индикатор «печатает...» всё время выполнения.
+
+    - Немедленно отправляет typing (до любых DB/LLM операций)
+    - В фоне обновляет каждые 4 секунды
+    - Гарантированно отменяет фоновую задачу при выходе
+    """
+    chat = update.effective_chat
+    if chat is None:
+        return await coro
+
+    # Немедленно — до любых DB-вызовов и rate limit проверок
+    try:
+        await context.bot.send_chat_action(chat_id=chat.id, action="typing")
+    except Exception:
+        pass
+
+    task = asyncio.create_task(_typing_loop(chat.id, context))
+    try:
+        return await coro
+    finally:
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
+
+
 async def _send_long_message(update: Update, text: str, max_length: int = 4096,
                               reply_markup: InlineKeyboardMarkup = None) -> None:
     """Отправляет длинное сообщение, разбивая на части."""
@@ -210,7 +256,10 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обработчик команды /start. Поддержка рефералов: /start ref_<UID>."""
     if not update.message or not update.effective_user:
         return
+    await _with_typing(update, context, _cmd_start_inner(update, context))
 
+
+async def _cmd_start_inner(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
     username = update.effective_user.username
     first_name = update.effective_user.first_name
@@ -454,6 +503,10 @@ async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Бесплатное ежедневное послание от Софии (раз в день)."""
     if not update.message or not update.effective_user:
         return
+    await _with_typing(update, context, _cmd_today_inner(update, context))
+
+
+async def _cmd_today_inner(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
     user = await db.get_user(user_id)
     if not user:
@@ -644,6 +697,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not update.message or not update.effective_user:
         return
 
+    await _with_typing(update, context, _handle_message_inner(update, context))
+
+
+async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Внутренняя логика handle_message, запускается под typing-индикатором."""
     user_id = update.effective_user.id
     text = update.message.text or ""
     text_stripped = text.strip()
@@ -1527,6 +1585,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     await query.answer()
+    await _with_typing(update, context, _handle_callback_inner(update, context))
+
+
+async def _handle_callback_inner(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Внутренняя логика handle_callback — под typing-индикатором."""
+    query = update.callback_query
     data = query.data or ""
     user_id = query.from_user.id
 
@@ -1806,6 +1870,10 @@ async def cmd_mood(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """София спрашивает о настроении — заботливая проверка."""
     if not update.message or not update.effective_user:
         return
+    await _with_typing(update, context, _cmd_mood_inner(update, context))
+
+
+async def _cmd_mood_inner(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
     user = await db.get_user(user_id)
     if not user:
@@ -1840,6 +1908,10 @@ async def cmd_card_of_day(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     """Карта дня — ежедневная мини-практика через одну карту Таро."""
     if not update.message or not update.effective_user:
         return
+    await _with_typing(update, context, _cmd_card_of_day_inner(update, context))
+
+
+async def _cmd_card_of_day_inner(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
     user = await db.get_user(user_id)
     if not user:
@@ -1880,6 +1952,10 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     """Обработка голосовых сообщений — София реагирует тепло, но просит текст."""
     if not update.message or not update.effective_user:
         return
+    await _with_typing(update, context, _handle_voice_inner(update, context))
+
+
+async def _handle_voice_inner(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
     user = await db.get_or_create_user(
         user_id,
@@ -1919,6 +1995,10 @@ async def handle_sticker(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     """Реакция на стикер — тёплая, но с просьбой текста."""
     if not update.message or not update.effective_user:
         return
+    await _with_typing(update, context, _handle_sticker_inner(update, context))
+
+
+async def _handle_sticker_inner(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
     user = await db.get_or_create_user(
         user_id,
@@ -1944,6 +2024,10 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     """Реакция на фото."""
     if not update.message or not update.effective_user:
         return
+    await _with_typing(update, context, _handle_photo_inner(update, context))
+
+
+async def _handle_photo_inner(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
     user = await db.get_or_create_user(
         user_id,
@@ -1975,6 +2059,10 @@ async def handle_video_note(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     """Реакция на видео-кружок — София просит текст."""
     if not update.message or not update.effective_user:
         return
+    await _with_typing(update, context, _handle_video_note_inner(update, context))
+
+
+async def _handle_video_note_inner(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
     user = await db.get_or_create_user(
         user_id,
