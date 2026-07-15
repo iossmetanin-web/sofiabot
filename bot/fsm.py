@@ -28,6 +28,7 @@ class SofiaState(str, Enum):
     TARO_FULL = "TARO_FULL"                  # Полный расклад (20 карт)
     HOROSCOPE = "HOROSCOPE"                  # Персональный гороскоп
     BLOCKED = "BLOCKED"                      # Блокировка за грубость
+    AWAITING_DELETE_CONFIRM = "AWAITING_DELETE_CONFIRM"  # GDPR: ожидание подтверждения удаления
 
 
 # Текстовые триггеры для особых команд (без кнопок!)

@@ -56,6 +56,11 @@ async def init_db():
         await conn.execute('ALTER TABLE users ADD COLUMN IF NOT EXISTS last_free_card_at TIMESTAMP')
         await conn.execute('ALTER TABLE users ADD COLUMN IF NOT EXISTS last_topic_summary TEXT')
         await conn.execute('ALTER TABLE users ADD COLUMN IF NOT EXISTS onboarding_completed BOOLEAN DEFAULT FALSE')
+        # Концепция v2 round 2 — рефералы и daily horoscope
+        await conn.execute('ALTER TABLE users ADD COLUMN IF NOT EXISTS referred_by BIGINT')
+        await conn.execute('ALTER TABLE users ADD COLUMN IF NOT EXISTS referral_reward_given BOOLEAN DEFAULT FALSE')
+        await conn.execute('ALTER TABLE users ADD COLUMN IF NOT EXISTS last_daily_horoscope_date DATE')
+        await conn.execute('ALTER TABLE users ADD COLUMN IF NOT EXISTS daily_horoscope_opt_in BOOLEAN DEFAULT FALSE')
 
         # ─── conversations ───
         await conn.execute('''
@@ -577,5 +582,195 @@ async def get_user_stats() -> list[dict]:
             FROM users ORDER BY created_at DESC
         """)
         return [dict(r) for r in rows]
+    finally:
+        await conn.close()
+
+
+# ─── Referrals (концепция v2 round 2) ───
+
+async def set_referred_by(user_id: int, referred_by: int):
+    """Устанавливает реферера (только если ещё не установлен и не сам себя)."""
+    if user_id == referred_by:
+        return
+    conn = await get_conn()
+    try:
+        await conn.execute(
+            """UPDATE users SET referred_by = $1
+               WHERE user_id = $2 AND referred_by IS NULL""",
+            referred_by, user_id,
+        )
+    finally:
+        await conn.close()
+
+
+async def get_referral_count(user_id: int) -> int:
+    """Сколько пользователей пришли по реферальной ссылке этого пользователя."""
+    conn = await get_conn()
+    try:
+        count = await conn.fetchval(
+            "SELECT COUNT(*) FROM users WHERE referred_by = $1", user_id
+        )
+        return count or 0
+    finally:
+        await conn.close()
+
+
+async def mark_referral_reward_given(user_id: int):
+    conn = await get_conn()
+    try:
+        await conn.execute(
+            "UPDATE users SET referral_reward_given = TRUE WHERE user_id = $1",
+            user_id,
+        )
+    finally:
+        await conn.close()
+
+
+async def was_referred(user_id: int) -> bool:
+    conn = await get_conn()
+    try:
+        v = await conn.fetchval(
+            "SELECT referred_by IS NOT NULL FROM users WHERE user_id = $1", user_id
+        )
+        return bool(v)
+    finally:
+        await conn.close()
+
+
+# ─── Daily horoscope ───
+
+async def can_get_daily_horoscope(user_id: int) -> bool:
+    """True, если сегодня пользователь ещё не получал daily horoscope."""
+    conn = await get_conn()
+    try:
+        last = await conn.fetchval(
+            "SELECT last_daily_horoscope_date FROM users WHERE user_id = $1", user_id
+        )
+        if last is None:
+            return True
+        today = datetime.now(timezone.utc).date()
+        return last < today
+    finally:
+        await conn.close()
+
+
+async def mark_daily_horoscope_used(user_id: int):
+    conn = await get_conn()
+    try:
+        await conn.execute(
+            "UPDATE users SET last_daily_horoscope_date = CURRENT_DATE WHERE user_id = $1",
+            user_id,
+        )
+    finally:
+        await conn.close()
+
+
+async def set_daily_horoscope_opt_in(user_id: int, opt_in: bool):
+    conn = await get_conn()
+    try:
+        await conn.execute(
+            "UPDATE users SET daily_horoscope_opt_in = $1 WHERE user_id = $2",
+            opt_in, user_id,
+        )
+    finally:
+        await conn.close()
+
+
+async def get_daily_horoscope_subscribers() -> list[dict]:
+    """Пользователи, подписанные на daily horoscope и завершившие онбординг."""
+    conn = await get_conn()
+    try:
+        rows = await conn.fetch("""
+            SELECT user_id, name, first_name, birth_date, birth_time, birth_place
+            FROM users
+            WHERE daily_horoscope_opt_in = TRUE
+              AND onboarding_completed = TRUE
+              AND is_blocked = FALSE
+              AND birth_date IS NOT NULL
+            ORDER BY user_id
+            LIMIT 100
+        """)
+        return [dict(r) for r in rows]
+    finally:
+        await conn.close()
+
+
+# ─── Admin analytics (расширенная) ───
+
+async def get_admin_analytics() -> dict:
+    """Сводная статистика для /stats."""
+    conn = await get_conn()
+    try:
+        total_users = await conn.fetchval("SELECT COUNT(*) FROM users") or 0
+        active_24h = await conn.fetchval(
+            "SELECT COUNT(*) FROM users WHERE last_seen_at > NOW() - INTERVAL '24 hours'"
+        ) or 0
+        active_7d = await conn.fetchval(
+            "SELECT COUNT(*) FROM users WHERE last_seen_at > NOW() - INTERVAL '7 days'"
+        ) or 0
+        onboarding_done = await conn.fetchval(
+            "SELECT COUNT(*) FROM users WHERE onboarding_completed = TRUE"
+        ) or 0
+        total_crystals = await conn.fetchval("SELECT COALESCE(SUM(crystals), 0) FROM users") or 0
+        total_messages = await conn.fetchval("SELECT COUNT(*) FROM conversations") or 0
+        total_transactions = await conn.fetchval(
+            "SELECT COUNT(*) FROM transactions WHERE type = 'spend'"
+        ) or 0
+        blocked_users = await conn.fetchval(
+            "SELECT COUNT(*) FROM users WHERE is_blocked = TRUE"
+        ) or 0
+        referral_count = await conn.fetchval(
+            "SELECT COUNT(*) FROM users WHERE referred_by IS NOT NULL"
+        ) or 0
+        daily_subscribers = await conn.fetchval(
+            "SELECT COUNT(*) FROM users WHERE daily_horoscope_opt_in = TRUE"
+        ) or 0
+
+        # Конверсия: % пользователей, совершивших хотя бы одну покупку
+        paying_users = await conn.fetchval(
+            """SELECT COUNT(DISTINCT user_id) FROM transactions WHERE type = 'spend'"""
+        ) or 0
+        conversion = round((paying_users / total_users * 100), 1) if total_users else 0.0
+
+        # Топ-5 активных по сообщениям
+        top_active = await conn.fetch("""
+            SELECT name, first_name, username, message_count, crystals
+            FROM users WHERE is_blocked = FALSE
+            ORDER BY message_count DESC LIMIT 5
+        """)
+        top_active = [dict(r) for r in top_active]
+
+        return {
+            "total_users": total_users,
+            "active_24h": active_24h,
+            "active_7d": active_7d,
+            "onboarding_done": onboarding_done,
+            "total_crystals": total_crystals,
+            "total_messages": total_messages,
+            "paid_transactions": total_transactions,
+            "paying_users": paying_users,
+            "conversion_pct": conversion,
+            "blocked_users": blocked_users,
+            "referral_users": referral_count,
+            "daily_subscribers": daily_subscribers,
+            "top_active": top_active,
+        }
+    finally:
+        await conn.close()
+
+
+# ─── GDPR: удаление данных пользователя ───
+
+async def delete_user_data(user_id: int) -> bool:
+    """Полное удаление всех данных пользователя. Возвращает True при успехе."""
+    conn = await get_conn()
+    try:
+        async with conn.transaction():
+            # FK ON DELETE CASCADE сработает для conversations, memory_facts,
+            # emotional_memory, transactions. rate_limits — без FK, удалим вручную.
+            await conn.execute("DELETE FROM rate_limits WHERE user_id = $1", user_id)
+            result = await conn.execute("DELETE FROM users WHERE user_id = $1", user_id)
+            # result вида "DELETE 1" или "DELETE 0"
+            return "1" in result.split()[-1] if result else False
     finally:
         await conn.close()

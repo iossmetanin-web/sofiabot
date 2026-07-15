@@ -549,6 +549,41 @@ async def generate_return_greeting(
     return await _llm_call(contents, timeout=8.0)
 
 
+# ──────────────────────── Ежедневный гороскоп (короткий) ────────────────────────
+
+async def generate_daily_horoscope(
+    name: str, birth_date: str, emotional: list[dict] = None
+) -> str:
+    """Короткое ежедневное сообщение от Софии (3-5 предложений).
+    Бесплатное, раз в день. Основано на дате рождения + эмоциональной памяти."""
+    from datetime import datetime as _dt
+    today_str = _dt.now().strftime("%d %B %Y")
+
+    em_lines = ""
+    if emotional:
+        em_lines = "\nЭмоциональная память о пользователе:\n" + "\n".join(
+            f"- {em.get('memory_type','?')}: {em.get('content','')}" for em in emotional[:3]
+        )
+
+    prompt = f"""Сегодня {today_str}. Пользователя зовут {name}, дата рождения {birth_date}.{em_lines}
+
+Напиши короткое утреннее сообщение от лица Софии (3-5 предложений). Это «послание дня» — не полный гороскоп, а тёплая весточка, как от бабушки, которая подумала о тебе утром.
+
+Структура:
+- 1 предложение: тёплое приветствие, намёк на то, что София думала о человеке
+- 1-2 предложения: образный «знак дня» — на что обратить внимание (опирайся на дату рождения и эмоциональную память, если есть)
+- 1 предложение: мягкий вопрос или напутствие
+
+Не используй астрологические термины. Образно, тепло. Без markdown. Заканчивай вопросом или тёплым напутствием.
+Не более 5 предложений."""
+    contents = [
+        {"role": "user", "parts": [{"text": SYSTEM_PROMPT}]},
+        {"role": "model", "parts": [{"text": "Поняла."}]},
+        {"role": "user", "parts": [{"text": prompt}]},
+    ]
+    return await _llm_call(contents, timeout=8.0)
+
+
 # ──────────────────────── Расклады Таро ────────────────────────
 
 async def generate_taro_reading(name: str, question: str, numbers: list[int], full: bool = False) -> str:
