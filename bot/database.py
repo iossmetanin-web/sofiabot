@@ -64,6 +64,9 @@ async def init_db():
         # Round 5 — карта дня и последний отправленный бродкаст
         await conn.execute('ALTER TABLE users ADD COLUMN IF NOT EXISTS last_card_of_day_at TIMESTAMP')
         await conn.execute('ALTER TABLE users ADD COLUMN IF NOT EXISTS last_broadcast_at TIMESTAMP')
+        # Round 6 — коммерческая модель: дневной лимит бесплатных сообщений
+        await conn.execute('ALTER TABLE users ADD COLUMN IF NOT EXISTS daily_message_count INTEGER DEFAULT 0')
+        await conn.execute('ALTER TABLE users ADD COLUMN IF NOT EXISTS daily_message_date DATE DEFAULT NULL')
 
         # ─── conversations ───
         await conn.execute('''
@@ -264,6 +267,52 @@ async def increment_message_count(user_id: int) -> int:
             user_id,
         )
         return new_count
+    finally:
+        await conn.close()
+
+
+async def increment_daily_message_count(user_id: int) -> int:
+    """Увеличивает дневной счётчик сообщений.
+
+    Если последний раз считали в другой день — сбрасываем в 1.
+    Возвращает текущее количество сообщений за сегодня.
+    """
+    conn = await get_conn()
+    try:
+        new_count = await conn.fetchval(
+            """UPDATE users
+               SET daily_message_count = CASE
+                       WHEN daily_message_date = CURRENT_DATE THEN daily_message_count + 1
+                       ELSE 1
+                   END,
+                   daily_message_date = CURRENT_DATE,
+                   updated_at = NOW()
+               WHERE user_id = $1
+               RETURNING daily_message_count""",
+            user_id,
+        )
+        return new_count or 0
+    finally:
+        await conn.close()
+
+
+async def get_daily_message_count(user_id: int) -> int:
+    """Возвращает количество сообщений за сегодня (0 если в другой день)."""
+    conn = await get_conn()
+    try:
+        row = await conn.fetchrow(
+            """SELECT daily_message_count, daily_message_date FROM users WHERE user_id = $1""",
+            user_id,
+        )
+        if not row:
+            return 0
+        if row["daily_message_date"] is None:
+            return 0
+        # Если дата не сегодня — возвращаем 0
+        from datetime import date as _date
+        if row["daily_message_date"] != _date.today():
+            return 0
+        return row["daily_message_count"] or 0
     finally:
         await conn.close()
 

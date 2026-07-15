@@ -229,6 +229,14 @@ def _admin_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
+def _buy_keyboard() -> InlineKeyboardMarkup:
+    """Inline-кнопки для пополнения кристаллов."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("💎 Пополнить кристаллы", callback_data="buy:info")],
+        [InlineKeyboardButton("🔙 К меню", callback_data="reading:deeper")],
+    ])
+
+
 # ─────────────────── Грубость ───────────────────
 
 RUDENESS_RESPONSES = [
@@ -527,6 +535,17 @@ async def _cmd_today_inner(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         )
         return
 
+    # Round 6: /today теперь платный
+    cost = config.TODAY_COST
+    crystals = user.get("crystals", 0)
+    if crystals < cost:
+        response = (
+            f"Послание дня стоит {cost} 💎. У тебя {crystals} 💎. "
+            f"Пополнить можно через /buy."
+        )
+        await update.effective_message.reply_text(response, reply_markup=_buy_keyboard())
+        return
+
     name = user.get("name") or user.get("first_name") or "милый человек"
     birth_date = user.get("birth_date")
     date_str = birth_date.strftime("%d.%m.%Y") if hasattr(birth_date, "strftime") else str(birth_date) if birth_date else ""
@@ -535,11 +554,20 @@ async def _cmd_today_inner(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     await update.effective_message.reply_text("🌅 Дай минутку, всматриваюсь в твой день...")
 
     try:
+        success = await db.spend_crystals(user_id, cost, "Послание дня")
+        if not success:
+            await update.effective_message.reply_text(
+                "Не удалось списать кристаллы. Попробуй позже."
+            )
+            return
+        remaining = await db.get_user_crystals(user_id)
+        charge_notice = f"💸 Списано {cost} 💎 · Осталось: {remaining} 💎\n\n"
+
         emotional = await db.get_emotional_memory(user_id, min_importance=3)
         daily_msg = await generate_daily_horoscope(name=name, birth_date=date_str, emotional=emotional, zodiac=zodiac)
         await db.mark_daily_horoscope_used(user_id)
         await db.save_message(user_id, "sofia", daily_msg, "daily_horoscope")
-        await update.effective_message.reply_text(daily_msg)
+        await update.effective_message.reply_text(charge_notice + daily_msg)
     except Exception as e:
         logger.error(f"cmd_today error: {e}", exc_info=True)
         await update.effective_message.reply_text(
@@ -639,14 +667,16 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     text = (
         "🌙 Я — София. Вот что я умею:\n\n"
-        "💬 Просто пиши — и мы поговорим\n"
-        "🌅 /today — послание дня (бесплатно, раз в день)\n"
-        "🃏 /card_of_day — карта дня (раз в 20 часов)\n"
-        "💚 /mood — я спрошу, как ты (с заботой)\n"
+        "💬 Просто пиши — и мы поговорим "
+        f"(первые {config.DAILY_FREE_MESSAGES} сообщений в день бесплатно)\n"
+        f"🌅 /today — послание дня ({config.TODAY_COST} 💎, раз в день)\n"
+        f"🃏 /card_of_day — карта дня (0 💎, раз в {config.CARD_OF_DAY_COOLDOWN_HOURS}ч)\n"
+        f"💚 /mood — я спрошу, как ты ({config.MOOD_COST} 💎)\n"
         "📜 /profile — твоя карточка\n"
         "💎 /balance — сколько кристаллов\n"
+        f"💎 /buy — пополнить кристаллы\n"
         "📖 «история» — последние сообщения\n"
-        "🔗 /invite — пригласить близкого (+1 💎 за каждого)\n"
+        f"🔗 /invite — пригласить близкого (+1 💎 за каждого)\n"
         "🌅 /subscribe — утренние весточки от меня\n"
         "📥 /export_my_history — наша история диалога\n"
         "🔄 /reset — начать разговор заново (если застрял)\n"
@@ -658,7 +688,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"🔮 «малый расклад» — 5 карт ({config.TARO_SMALL_COST} 💎)\n"
         f"🃏 «полный расклад» — 20 карт ({config.TARO_FULL_COST} 💎)\n"
         f"⭐ «гороскоп» — персональный ({config.HOROSCOPE_COST} 💎)\n"
-        f"🗺️ «бесплатная карта» — 1 карта (0 💎)\n\n"
+        f"🗺️ «бесплатная карта» — 1 карта (0 💎, раз в {config.FREE_CARD_COOLDOWN_HOURS}ч)\n\n"
         f"У тебя {crystals} 💎"
     )
     await update.effective_message.reply_text(text, reply_markup=_paid_reading_keyboard(crystals))
@@ -1073,7 +1103,61 @@ async def _handle_return(update: Update, user_id: int, user: dict, user_message:
 
 
 async def _handle_conversation(update: Update, user_id: int, text: str, user: dict) -> None:
-    """Свободный диалог — основное состояние бота."""
+    """Свободный диалог — основное состояние бота.
+
+    Round 6: дневной лимит бесплатных сообщений (DAILY_FREE_MESSAGES).
+    После лимита — предлагаем купить пакет сообщений за кристаллы
+    или подождать до завтра.
+    """
+    # ─── Дневной лимит бесплатных сообщений ───
+    daily_count = await db.increment_daily_message_count(user_id)
+
+    if daily_count > config.DAILY_FREE_MESSAGES:
+        # Проверяем: может, пользователь уже купил пакет сегодня
+        # (простая логика: если daily_count <= FREE + package_size*N, значит N пакетов куплено)
+        # Лимит: FREE + (FREE * 5) максимум, потом жёстко отказываем
+        over_limit = daily_count - config.DAILY_FREE_MESSAGES
+        packages_bought = over_limit // config.DAILY_PACKAGE_SIZE
+        # Если over_limit кратно package_size — нужно предложить новый пакет
+        if over_limit % config.DAILY_PACKAGE_SIZE == 0:
+            # Это сообщение — последнее в текущем «бесплатном» или «платном» пакете
+            # Завершаем текущий ответ (если он ещё есть в лимите) и предлагаем продлить
+            crystals = user.get("crystals", 0)
+            if crystals < config.DAILY_COST_CRYSTALS:
+                # Нет кристаллов — мягко отказываем
+                response = (
+                    f"🌙 Милый человек, ты сегодня уже много поговорил(а) со мной — "
+                    f"я устала считать твои слова. На сегодня хватит.\n\n"
+                    f"Завтра я снова буду здесь, с новыми силами. А если хочешь поговорить "
+                    f"ещё сейчас — можно приобрести дополнительные "
+                    f"{config.DAILY_PACKAGE_SIZE} сообщений за {config.DAILY_COST_CRYSTALS} 💎.\n\n"
+                    f"У тебя сейчас {crystals} 💎. Пополнить — через /buy."
+                )
+                await update.effective_message.reply_text(response, reply_markup=_buy_keyboard())
+                await db.save_message(user_id, "sofia", response, "daily_limit_reached")
+                return
+            # Списываем кристаллы и продолжаем
+            success = await db.spend_crystals(
+                user_id, config.DAILY_COST_CRYSTALS,
+                f"Пакет {config.DAILY_PACKAGE_SIZE} сообщений (день {daily_count})"
+            )
+            if not success:
+                response = (
+                    "Не удалось списать кристаллы. Попробуй позже или пополни баланс через /buy."
+                )
+                await update.effective_message.reply_text(response, reply_markup=_buy_keyboard())
+                return
+            remaining = await db.get_user_crystals(user_id)
+            charge_notice = (
+                f"💸 Списано {config.DAILY_COST_CRYSTALS} 💎 за "
+                f"{config.DAILY_PACKAGE_SIZE} сообщений · Осталось: {remaining} 💎\n\n"
+            )
+        else:
+            # Платный пакет ещё действует — отвечаем без уведомления
+            charge_notice = ""
+    else:
+        charge_notice = ""
+
     msg_count, facts, history, emotional = await asyncio.gather(
         db.increment_message_count(user_id),
         db.get_memory_facts(user_id, min_importance=3),
@@ -1112,7 +1196,7 @@ async def _handle_conversation(update: Update, user_id: int, text: str, user: di
     )
 
     await db.save_message(user_id, "sofia", response)
-    await _send_long_message(update, response)
+    await _send_long_message(update, f"{charge_notice}{response}" if charge_notice else response)
 
     # Извлекаем факты и эмоциональную память каждые 5 сообщений
     if msg_count > 0 and msg_count % config.MEMORY_EXTRACT_INTERVAL == 0:
@@ -1377,12 +1461,16 @@ async def _execute_taro_reading(update: Update, user_id: int, user: dict,
         crystals = await db.get_user_crystals(user_id)
         response = (
             f"Не хватает кристаллов. У тебя {crystals} 💎, нужно {cost} 💎. "
-            f"Обратись к администратору."
+            f"Пополнить можно через команду /buy."
         )
-        await update.effective_message.reply_text(response)
+        await update.effective_message.reply_text(response, reply_markup=_buy_keyboard())
         await db.save_message(user_id, "sofia", response, "insufficient_crystals")
         await db.update_user_state(user_id, SofiaState.CONVERSATION)
         return
+
+    # Явное уведомление о списании
+    remaining = await db.get_user_crystals(user_id)
+    charge_notice = f"💸 Списано {cost} 💎 · Осталось: {remaining} 💎"
 
     recent = await db.get_recent_messages(user_id, limit=4)
     topic_parts = [m["content"][:80] for m in recent if m["role"] == "user"]
@@ -1404,8 +1492,9 @@ async def _execute_taro_reading(update: Update, user_id: int, user: dict,
     )
 
     type_label = "🃏 Полный расклад судьбы" if full else "🔮 Малый расклад"
+    full_text = f"{charge_notice}\n\n{type_label}\n\n{reading}"
     await db.save_message(user_id, "sofia", reading, f"taro_{'full' if full else 'small'}")
-    await _send_long_message(update, f"{type_label}\n\n{reading}")
+    await _send_long_message(update, full_text)
     await db.update_user_state(user_id, SofiaState.CONVERSATION)
     await db.update_user_profile(user_id, reading_type=None)
 
@@ -1429,12 +1518,16 @@ async def _execute_thematic_reading(update: Update, user_id: int, user: dict,
         crystals = await db.get_user_crystals(user_id)
         response = (
             f"Не хватает кристаллов. У тебя {crystals} 💎, нужно {cost} 💎. "
-            f"Обратись к администратору."
+            f"Пополнить можно через команду /buy."
         )
-        await update.effective_message.reply_text(response)
+        await update.effective_message.reply_text(response, reply_markup=_buy_keyboard())
         await db.save_message(user_id, "sofia", response, "insufficient_crystals")
         await db.update_user_state(user_id, SofiaState.CONVERSATION)
         return
+
+    # Явное уведомление о списании
+    remaining = await db.get_user_crystals(user_id)
+    charge_notice = f"💸 Списано {cost} 💎 · Осталось: {remaining} 💎"
 
     recent = await db.get_recent_messages(user_id, limit=4)
     topic_parts = [m["content"][:80] for m in recent if m["role"] == "user"]
@@ -1453,8 +1546,9 @@ async def _execute_thematic_reading(update: Update, user_id: int, user: dict,
         card_names=card_names,
     )
 
+    full_text = f"{charge_notice}\n\n{label}\n\n{reading}"
     await db.save_message(user_id, "sofia", reading, msg_tag)
-    await _send_long_message(update, f"{label}\n\n{reading}")
+    await _send_long_message(update, full_text)
     await db.update_user_state(user_id, SofiaState.CONVERSATION)
     await db.update_user_profile(user_id, reading_type=None)
 
@@ -1571,9 +1665,9 @@ async def _execute_horoscope(update: Update, user_id: int, user: dict) -> None:
     if crystals < cost:
         response = (
             f"Не хватает кристаллов. У тебя {crystals} 💎, нужно {cost} 💎. "
-            f"Обратись к администратору."
+            f"Пополнить можно через команду /buy."
         )
-        await update.effective_message.reply_text(response)
+        await update.effective_message.reply_text(response, reply_markup=_buy_keyboard())
         await db.save_message(user_id, "sofia", response, "insufficient_crystals")
         await db.update_user_state(user_id, SofiaState.CONVERSATION)
         return
@@ -1583,6 +1677,10 @@ async def _execute_horoscope(update: Update, user_id: int, user: dict) -> None:
         await update.effective_message.reply_text("Не удалось списать кристаллы. Попробуй позже.")
         await db.update_user_state(user_id, SofiaState.CONVERSATION)
         return
+
+    # Явное уведомление о списании
+    remaining = await db.get_user_crystals(user_id)
+    charge_notice = f"💸 Списано {cost} 💎 · Осталось: {remaining} 💎"
 
     name = user.get("name") or user.get("first_name") or "милый человек"
     birth_date = user.get("birth_date")
@@ -1603,8 +1701,9 @@ async def _execute_horoscope(update: Update, user_id: int, user: dict) -> None:
         zodiac=zodiac,
     )
 
+    full_text = f"{charge_notice}\n\n⭐ Твой персональный гороскоп\n\n{horoscope}"
     await db.save_message(user_id, "sofia", horoscope, "horoscope")
-    await _send_long_message(update, f"⭐ Твой персональный гороскоп\n\n{horoscope}")
+    await _send_long_message(update, full_text)
     await db.update_user_state(user_id, SofiaState.CONVERSATION)
 
 
@@ -1659,6 +1758,15 @@ async def _handle_callback_inner(update: Update, context: ContextTypes.DEFAULT_T
         await _safe_reply(update, response)
         await db.save_message(user_id, "sofia", response, "hook_declined")
         await db.update_user_state(user_id, SofiaState.CONVERSATION)
+    elif data == "buy:info":
+        # Round 6: показ тарифов при нажатии на «Пополнить кристаллы»
+        crystals = user.get("crystals", 0)
+        instructions = config.PAYMENT_INSTRUCTIONS.format(admin=config.ADMIN_CONTACT)
+        text = (
+            f"💎 Твой баланс: {crystals} 💎\n\n"
+            f"{instructions}"
+        )
+        await _safe_reply(update, text)
     elif data == "admin:stats":
         if user_id == config.ADMIN_ID:
             await cmd_stats(update, context)
@@ -1918,14 +2026,34 @@ async def _cmd_mood_inner(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
         return
 
+    # Round 6: /mood теперь платный
+    cost = config.MOOD_COST
+    crystals = user.get("crystals", 0)
+    if crystals < cost:
+        response = (
+            f"Проверка настроения стоит {cost} 💎. У тебя {crystals} 💎. "
+            f"Пополнить можно через /buy."
+        )
+        await update.effective_message.reply_text(response, reply_markup=_buy_keyboard())
+        return
+
     name = user.get("name") or user.get("first_name") or "милый человек"
     zodiac = _get_zodiac_from_user(user)
 
     try:
+        success = await db.spend_crystals(user_id, cost, "Проверка настроения")
+        if not success:
+            await update.effective_message.reply_text(
+                "Не удалось списать кристаллы. Попробуй позже."
+            )
+            return
+        remaining = await db.get_user_crystals(user_id)
+        charge_notice = f"💸 Списано {cost} 💎 · Осталось: {remaining} 💎\n\n"
+
         emotional = await db.get_emotional_memory(user_id, min_importance=2)
         last_topic = user.get("last_topic_summary") or ""
         checkin = await generate_mood_checkin(name, emotional, last_topic, zodiac)
-        await update.effective_message.reply_text(checkin)
+        await update.effective_message.reply_text(charge_notice + checkin)
         await db.save_message(user_id, "sofia", checkin, "mood_checkin")
     except Exception as e:
         logger.error(f"cmd_mood error: {e}", exc_info=True)
@@ -1976,6 +2104,38 @@ async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "📢 Напиши текст рассылки — я отправлю его всем активным пользователям. "
         "Для отмены напиши «отмена»."
     )
+
+
+# ─────────────────── Round 6: /buy — пополнение кристаллов ───────────────────
+
+async def cmd_buy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Показывает тарифы и инструкцию по пополнению кристаллов."""
+    if not update.message or not update.effective_user:
+        return
+    user_id = update.effective_user.id
+    user = await db.get_user(user_id)
+    crystals = user.get("crystals", 0) if user else 0
+
+    instructions = config.PAYMENT_INSTRUCTIONS.format(admin=config.ADMIN_CONTACT)
+    text = (
+        f"💎 Твой баланс: {crystals} 💎\n\n"
+        f"{instructions}\n\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"📊 Цены услуг:\n"
+        f"• 💬 Сообщения диалога: {config.DAILY_FREE_MESSAGES} бесплатно в день, "
+        f"далее {config.DAILY_COST_CRYSTALS} 💎 за {config.DAILY_PACKAGE_SIZE} сообщений\n"
+        f"• 🔮 Малый расклад (5 карт) — {config.TARO_SMALL_COST} 💎\n"
+        f"• 🃏 Полный расклад (20 карт) — {config.TARO_FULL_COST} 💎\n"
+        f"• ❤️ Расклад на любовь — {config.TARO_LOVE_COST} 💎\n"
+        f"• ⚖️ Расклад на выбор — {config.TARO_DECISION_COST} 💎\n"
+        f"• 💼 Расклад на дело — {config.TARO_CAREER_COST} 💎\n"
+        f"• ⭐ Персональный гороскоп — {config.HOROSCOPE_COST} 💎\n"
+        f"• 🌅 Послание дня (/today) — {config.TODAY_COST} 💎\n"
+        f"• 💭 Проверка настроения (/mood) — {config.MOOD_COST} 💎\n"
+        f"• 🗺️ Бесплатная карта — 0 💎 (раз в {config.FREE_CARD_COOLDOWN_HOURS}ч)\n"
+        f"• 🃏 Карта дня — 0 💎 (раз в {config.CARD_OF_DAY_COOLDOWN_HOURS}ч)"
+    )
+    await update.effective_message.reply_text(text, reply_markup=_buy_keyboard())
 
 
 # ─────────────────── Голосовые сообщения ───────────────────
@@ -2133,6 +2293,7 @@ def setup_handlers(application: Application) -> None:
     application.add_handler(CommandHandler("reset", cmd_reset))
     application.add_handler(CommandHandler("card_of_day", cmd_card_of_day))
     application.add_handler(CommandHandler("broadcast", cmd_broadcast))
+    application.add_handler(CommandHandler("buy", cmd_buy))
     application.add_handler(CallbackQueryHandler(handle_callback))
     # Голосовые, стикеры, фото, видео-кружки — ДО текстового обработчика
     application.add_handler(MessageHandler(filters.VOICE, handle_voice))

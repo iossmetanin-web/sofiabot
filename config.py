@@ -69,6 +69,25 @@ class Config:
     BROADCAST_BATCH: int = 25            # сколько пользователей за один запрос в /broadcast
     BROADCAST_RATE_MS: int = 35          # задержка между сообщениями в рассылке (Telegram ~30 msg/sec)
 
+    # ─── Round 6: коммерческая модель ───
+    DAILY_FREE_MESSAGES: int = 10        # сколько бесплатных сообщений диалога в день
+    DAILY_COST_CRYSTALS: int = 1         # цена за дополнительный пакет сообщений после лимита (5 шт)
+    DAILY_PACKAGE_SIZE: int = 5          # сколько сообщений в платном пакете
+    TODAY_COST: int = 1                  # /today — ежедневное послание
+    MOOD_COST: int = 1                   # /mood — проверка настроения
+    ADMIN_CONTACT: str = os.getenv("ADMIN_CONTACT", "@admin_username")  # контакт для пополнения
+    PAYMENT_INSTRUCTIONS: str = os.getenv(
+        "PAYMENT_INSTRUCTIONS",
+        "Для пополнения кристаллов напиши администратору {admin}.\n\n"
+        "Тарифы:\n"
+        "• 10 💎 — 199 ₽\n"
+        "• 25 💎 — 449 ₽\n"
+        "• 50 💎 — 799 ₽ (выгоднее)\n"
+        "• 100 💎 — 1490 ₽ (самый выгодный)\n\n"
+        "Оплата: перевод на карту / ЮMoney / крипта. "
+        "После оплаты кристаллы начисляются в течение 10 минут."
+    )
+
     @classmethod
     def validate(cls) -> list[str]:
         """Проверяет, что все обязательные переменные заданы."""
